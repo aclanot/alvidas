@@ -6,9 +6,11 @@ __pycache__/
 .venv
 env/
 venv/
+ENV/
 downloads/
 *.mp4
 *.mp3
 *.webm
 cookies.txt
 *.log
+.DS_Store

@@ -1,68 +1,104 @@
 # Telegram Video Downloader Bot
 
-A Telegram bot that downloads videos from TikTok, Instagram, YouTube, X/Twitter, Facebook, Reddit, and 1000+ other sites using the [reclip](https://github.com/averygan/reclip) download engine.
+A Telegram bot that downloads videos from TikTok, Instagram, YouTube, X/Twitter, Facebook, Reddit, and 1000+ other sites.
+
+Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) via the **reclip** download engine approach.
 
 ## Features
 
 - Downloads videos from 1000+ sites (via yt-dlp)
-- Supports Instagram with cookies (base64 encoded)
-- Runs as a Telegram bot - just send links
-- Deploys easily on Railway
+- Supports Instagram/TikTok/Twitter with cookies (base64 encoded)
+- Raw Bot API (no heavy libraries) - 50MB limit
+- Works in groups — only responds when URLs are detected
+- Auto-upgrades yt-dlp on every container start
 
 ## Deployment on Railway
 
 ### 1. Fork/Clone this repository
 
-Push this code to a GitHub repository or create a new one.
+Push this code to GitHub.
 
 ### 2. Create Telegram Bot
 
 1. Message [@BotFather](https://t.me/BotFather) on Telegram
 2. Send `/newbot` and follow instructions
-3. Copy the **bot token** (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+3. Copy the **bot token** (looks like `123456789:ABCdef...`)
 
 ### 3. Deploy to Railway
 
-1. Go to [Railway](https://railway.app) and create an account
-2. Click **New Project** → **Deploy from GitHub repo**
-3. Select your repository
-4. Add environment variables (see below)
-5. Deploy!
+1. Go to [Railway](https://railway.app) → New Project → Deploy from GitHub repo
+2. Select your repository
+3. Add environment variable: `TELEGRAM_BOT_TOKEN`
+4. Deploy!
 
-### 4. Environment Variables
+### 4. Optional: Instagram Cookies
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | ✅ Yes | Your bot token from @BotFather |
-| `INSTAGRAM_COOKIES_BASE64` | ❌ Optional | Base64-encoded cookies.txt for Instagram |
+For private Instagram content or to avoid rate limits:
 
-### 5. Getting Instagram Cookies (Optional)
+1. Log into Instagram in your browser
+2. Use extension like "Get cookies.txt" to export cookies
+3. Base64 encode: `cat cookies.txt | base64` or `base64 -i cookies.txt`
+4. Set `INSTAGRAM_COOKIES_BASE64` environment variable in Railway
 
-For private Instagram content, you need to provide cookies:
+## How it Works in Chat
 
-1. Install browser extension like "Get cookies.txt" (Chrome/Firefox)
-2. Log into Instagram in your browser
-3. Export cookies as `cookies.txt`
-4. Encode to base64:
-   ```bash
-   base64 -i cookies.txt -o cookies_base64.txt
-   ```
-   Or:
-   ```bash
-   cat cookies.txt | base64
-   ```
-5. Copy the base64 string to `INSTAGRAM_COOKIES_BASE64` environment variable
+**Private chat:**
+```
+You: https://tiktok.com/@user/video/123
+Bot: 🎵 Downloading…
+Bot: [video] 🎵 Video Title 12.5 MB
+```
+
+**Group chat:**
+```
+Someone: Check this out! https://youtube.com/shorts/abc
+Bot: ▶️ Downloading…
+Bot: [video] ▶️ Video Title 8.2 MB
+```
+
+Bot **only responds** when URLs are found. No URL = no response.
+
+## Supported Sites
+
+All sites supported by yt-dlp:
+
+- TikTok (videos + photos)
+- Instagram (reels, posts, stories with cookies)
+- YouTube (Shorts, videos)
+- X / Twitter (videos + photos)
+- Facebook
+- Reddit
+- Vimeo, Dailymotion, Twitch, SoundCloud
+- And 1000+ more!
+
+## Architecture
+
+- **bot.py** - Main bot logic, raw Telegram Bot API polling
+- **start.py** - Auto-upgrades yt-dlp before starting bot
+- **Download logic** - Uses reclip approach: subprocess calls to yt-dlp
+- **Dockerfile** - Python slim + ffmpeg
 
 ## File Structure
 
 ```
 .
-├── bot.py              # Main bot code (reclip logic)
-├── requirements.txt    # Python dependencies
-├── Procfile            # Railway worker process
-├── railway.toml        # Railway configuration
-└── README.md           # This file
+├── bot.py              # Main bot (raw Bot API, reclip logic)
+├── start.py            # Entry point (auto-updates yt-dlp)
+├── Dockerfile          # Container with ffmpeg
+├── requirements.txt    # aiohttp, yt-dlp
+├── railway.json       # Railway config
+├── .env.example       # Environment variables template
+└── README.md          # This file
 ```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | ✅ Yes | Bot token from @BotFather |
+| `INSTAGRAM_COOKIES_BASE64` | ❌ Optional | Base64 cookies for Instagram |
+| `TIKTOK_COOKIES_BASE64` | ❌ Optional | Base64 cookies for TikTok |
+| `TWITTER_COOKIES_BASE64` | ❌ Optional | Base64 cookies for Twitter/X |
 
 ## Local Testing
 
@@ -70,78 +106,17 @@ For private Instagram content, you need to provide cookies:
 # Install dependencies
 pip install -r requirements.txt
 
-# Install yt-dlp and ffmpeg
-# macOS: brew install yt-dlp ffmpeg
-# Ubuntu: apt install ffmpeg && pip install yt-dlp
+# Install ffmpeg (required)
+# macOS: brew install ffmpeg
+# Ubuntu: sudo apt install ffmpeg
 
-# Set environment variables
+# Set token
 export TELEGRAM_BOT_TOKEN=your_token_here
-export INSTAGRAM_COOKIES_BASE64=your_base64_cookies_optional
 
 # Run
-python bot.py
+python start.py
 ```
-
-## How It Works
-
-The bot uses the **same download logic** from [reclip](https://github.com/averygan/reclip):
-
-1. **Video Info** - Uses `yt-dlp -j` to fetch metadata
-2. **Download** - Uses `yt-dlp` with appropriate format options
-3. **Upload** - Sends the video file to Telegram chat
-
-### Key Code from reclip (app.py lines 16-74):
-
-```python
-def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
-    # ... subprocess run
-```
-
-### My Adaptation:
-
-- Integrated into Telegram bot framework
-- Added Instagram cookies support via base64 env variable
-- Added background threading for downloads
-- Added Telegram upload with size limits (50MB)
-
-## Bot Commands
-
-- `/start` - Welcome message
-- `/help` - Usage instructions
-- `/status` - Check active downloads (admin)
-
-## Supported Sites
-
-All sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md):
-
-- TikTok
-- Instagram (with cookies)
-- YouTube
-- X/Twitter
-- Facebook
-- Reddit
-- Vimeo
-- Twitch
-- Dailymotion
-- SoundCloud
-- Loom
-- Pinterest
-- Tumblr
-- And 1000+ more!
 
 ## License
 
-MIT (same as reclip)
+MIT

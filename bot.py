@@ -1,45 +1,100 @@
 import os
 import sys
 import re
-import uuid
-import glob
+import hashlib
 import json
 import base64
+import glob
 import subprocess
-import threading
-import tempfile
 import asyncio
+import logging
+import tempfile
+import shutil
+from pathlib import Path
 from urllib.parse import urlparse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import aiohttp
 
-# Configuration from environment variables
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-INSTAGRAM_COOKIES_BASE64 = os.environ.get("INSTAGRAM_COOKIES_BASE64")
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Telegram limit
-DOWNLOAD_DIR = tempfile.gettempdir()
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# Store active jobs
-jobs = {}
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+BOT_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+INSTAGRAM_COOKIES_BASE64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
+TIKTOK_COOKIES_BASE64 = os.environ.get("TIKTOK_COOKIES_BASE64", "")
+TWITTER_COOKIES_BASE64 = os.environ.get("TWITTER_COOKIES_BASE64", "")
+
+TELEGRAM_MAX_SIZE = 50 * 1024 * 1024
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "bot_downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+http_session: aiohttp.ClientSession = None
+processing = set()
+
+# URL patterns for supported platforms
+URL_PATTERNS = [
+    # TikTok
+    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[@\w./]+",
+    r"https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+",
+    r"https?://(?:www\.)?tiktok\.com/@[\w.]+/photo/\d+",
+    # YouTube
+    r"https?://(?:www\.)?youtube\.com/shorts/[\w-]+",
+    r"https?://(?:www\.)?youtu\.be/[\w-]+",
+    r"https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+",
+    r"https?://music\.youtube\.com/watch\?v=[\w-]+",
+    # Twitter/X
+    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+",
+    # Instagram
+    r"https?://(?:www\.)?instagram\.com/reel/[\w-]+",
+    r"https?://(?:www\.)?instagram\.com/reels/[\w-]+",
+    r"https?://(?:www\.)?instagram\.com/p/[\w-]+",
+    r"https?://(?:www\.)?instagram\.com/tv/[\w-]+",
+    # Facebook
+    r"https?://(?:www\.)?facebook\.com/(?:watch/\?v=|share/v/|reel/)[\w-]+",
+    r"https?://(?:www\.)?fb\.watch/[\w-]+",
+    # Reddit
+    r"https?://(?:www\.)?reddit\.com/r/\w+/comments/\w+/",
+    r"https?://(?:www\.)?redd\.it/\w+",
+]
+
+PLATFORM_EMOJI = {
+    "tiktok": "🎵",
+    "youtube": "▶️",
+    "twitter": "𝕏",
+    "instagram": "📷",
+    "facebook": "📘",
+    "reddit": "🤖",
+    "unknown": "🎬",
+}
 
 
-def get_cookies_path():
-    """Decode base64 cookies to temporary file if provided"""
-    if not INSTAGRAM_COOKIES_BASE64:
+def get_cookies_path(platform: str) -> Path | None:
+    """Get cookies file path for platform if configured via base64 env var"""
+    env_map = {
+        "instagram": INSTAGRAM_COOKIES_BASE64,
+        "tiktok": TIKTOK_COOKIES_BASE64,
+        "twitter": TWITTER_COOKIES_BASE64,
+    }
+    
+    base64_cookies = env_map.get(platform, "")
+    if not base64_cookies:
         return None
+    
     try:
-        cookies_content = base64.b64decode(INSTAGRAM_COOKIES_BASE64).decode('utf-8')
-        cookies_path = os.path.join(tempfile.gettempdir(), 'cookies.txt')
-        with open(cookies_path, 'w') as f:
-            f.write(cookies_content)
+        cookies_content = base64.b64decode(base64_cookies).decode('utf-8')
+        cookies_path = DOWNLOAD_DIR / f"{platform}_cookies.txt"
+        cookies_path.write_text(cookies_content)
         return cookies_path
     except Exception as e:
-        print(f"Error decoding cookies: {e}")
+        logger.error(f"Error decoding cookies for {platform}: {e}")
         return None
 
 
-def detect_platform(url):
+def detect_platform(url: str) -> str:
     """Detect which platform the URL belongs to"""
     domain = urlparse(url).netloc.lower()
     
@@ -53,354 +108,424 @@ def detect_platform(url):
         return 'twitter'
     elif 'facebook' in domain or 'fb.watch' in domain:
         return 'facebook'
-    elif 'reddit' in domain:
+    elif 'reddit' in domain or 'redd.it' in domain:
         return 'reddit'
     else:
-        return 'generic'
+        return 'unknown'
 
 
-def get_video_info(url, cookies_path=None):
+def extract_urls(text: str) -> list:
+    """Extract video URLs from text"""
+    urls = []
+    for pattern in URL_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            url = match.group(0)
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+async def get_session() -> aiohttp.ClientSession:
+    """Get or create HTTP session"""
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    return http_session
+
+
+async def bot_api_call(method: str, data: aiohttp.FormData, timeout: int = 120):
+    """Make raw Telegram Bot API call"""
+    session = await get_session()
+    async with session.post(f"{BOT_API_URL}/{method}", data=data, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+        result = await resp.json()
+        if not result.get("ok"):
+            raise Exception(result.get("description", f"Bot API {method} failed"))
+        return result
+
+
+async def bot_api_send_message(chat_id: int, text: str, reply_to: int = None):
+    """Send text message via Bot API"""
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(chat_id))
+    data.add_field("text", text)
+    if reply_to:
+        data.add_field("reply_to_message_id", str(reply_to))
+    return await bot_api_call("sendMessage", data, timeout=30)
+
+
+async def bot_api_edit_message(chat_id: int, message_id: int, text: str):
+    """Edit message text via Bot API"""
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(chat_id))
+    data.add_field("message_id", str(message_id))
+    data.add_field("text", text)
+    return await bot_api_call("editMessageText", data, timeout=30)
+
+
+async def bot_api_delete_message(chat_id: int, message_id: int):
+    """Delete message via Bot API"""
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(chat_id))
+    data.add_field("message_id", str(message_id))
+    try:
+        return await bot_api_call("deleteMessage", data, timeout=30)
+    except Exception:
+        pass
+
+
+async def bot_api_send_video(chat_id: int, file_path: str, caption: str, reply_to: int,
+                             duration: int = 0, width: int = 0, height: int = 0):
+    """Send video via Bot API"""
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(chat_id))
+    data.add_field("video", open(file_path, "rb"), filename="video.mp4", content_type="video/mp4")
+    if caption:
+        data.add_field("caption", caption[:1024])
+    if reply_to:
+        data.add_field("reply_to_message_id", str(reply_to))
+    if duration:
+        data.add_field("duration", str(duration))
+    if width:
+        data.add_field("width", str(width))
+    if height:
+        data.add_field("height", str(height))
+    data.add_field("supports_streaming", "true")
+    return await bot_api_call("sendVideo", data, timeout=120)
+
+
+async def delete_later(chat_id: int, message_id: int, delay: int = 10):
+    """Delete message after delay"""
+    await asyncio.sleep(delay)
+    await bot_api_delete_message(chat_id, message_id)
+
+
+# ============= RECLIP DOWNLOAD LOGIC =============
+
+async def get_video_info(url: str, cookies_path: Path = None) -> tuple:
     """Get video info using yt-dlp (from reclip logic)"""
     cmd = ["yt-dlp", "--no-playlist", "-j", url]
     
-    if cookies_path and detect_platform(url) == 'instagram':
-        cmd.extend(["--cookies", cookies_path])
+    if cookies_path:
+        cmd.extend(["--cookies", str(cookies_path)])
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return None, result.stderr.strip().split("\n")[-1]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         
-        info = json.loads(result.stdout)
+        if proc.returncode != 0:
+            return None, stderr.decode().strip().split("\n")[-1]
+        
+        info = json.loads(stdout.decode())
         return info, None
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         return None, "Timed out fetching video info"
     except Exception as e:
         return None, str(e)
 
 
-def run_download(job_id, url, format_choice, cookies_path=None):
-    """Download video using reclip logic"""
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+async def download_with_reclip(url: str, platform: str) -> tuple:
+    """
+    Download video using reclip's yt-dlp logic
+    Returns: (file_path, title, error)
+    """
+    job_id = os.urandom(4).hex()
+    output_dir = DOWNLOAD_DIR / job_id
+    output_dir.mkdir(exist_ok=True)
     
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    out_template = str(output_dir / "video.%(ext)s")
+    final_path = str(output_dir / "video_final.mp4")
     
-    # Add cookies for Instagram
-    if cookies_path and detect_platform(url) == 'instagram':
-        cmd.extend(["--cookies", cookies_path])
+    # Get cookies for this platform
+    cookies_path = get_cookies_path(platform)
     
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
+    # Build yt-dlp command (based on reclip app.py)
+    cmd = ["yt-dlp", "--no-playlist", "-o", out_template, "--no-warnings"]
+    
+    if cookies_path:
+        cmd.extend(["--cookies", str(cookies_path)])
+    
+    # Platform-specific format selection
+    if platform == "tiktok":
+        # Prefer H.264 codec for compatibility
+        cmd.extend(["-f", "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc1]/best[vcodec^=avc1]"])
+        cmd.extend(["--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64)"])
+        cmd.extend(["--merge-output-format", "mp4"])
+    elif platform == "twitter":
+        cmd.extend(["-f", "best[vcodec^=avc1][height<=720]/best[vcodec^=avc1]/best[height<=720]/best"])
+    elif platform == "instagram":
+        cmd.extend(["-f", "best[vcodec^=avc1]/best"])
     else:
-        # Best quality video
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+        cmd.extend(["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"])
     
-    # Add user-agent to avoid blocks
-    cmd += ["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
+    # User agent for all platforms
+    cmd.extend(["--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"])
     
     cmd.append(url)
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
+        logger.info(f"Downloading: {url}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+        if proc.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logger.error(f"yt-dlp error: {error_msg[:500]}")
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return None, None, f"❌ Download failed: {error_msg.strip().split(chr(10))[-1][:200]}"
+        
+        # Find downloaded files
+        files = list(output_dir.glob("video.*"))
         if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return None, None, "❌ No media found"
         
-        # Pick the right file
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
+        # Select best file (prefer mp4)
+        mp4_files = [f for f in files if f.suffix.lower() == ".mp4"]
+        chosen = mp4_files[0] if mp4_files else files[0]
+        
+        # Move to final path
+        shutil.move(str(chosen), final_path)
         
         # Clean up extra files
         for f in files:
-            if f != chosen:
+            if f.exists():
                 try:
-                    os.remove(f)
-                except OSError:
+                    f.unlink()
+                except:
                     pass
         
-        job["status"] = "done"
-        job["file"] = chosen
-        job["file_size"] = os.path.getsize(chosen)
+        # Get file size
+        file_size = Path(final_path).stat().st_size
         
-        # Generate filename
-        ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:30]
-            job["filename"] = f"{safe_title}{ext}" if safe_title else f"{job_id}{ext}"
-        else:
-            job["filename"] = f"{job_id}{ext}"
-            
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    welcome_text = """
-🎥 *Video Downloader Bot*
-
-Send me links from:
-• TikTok
-• Instagram (with cookies)
-• YouTube
-• X/Twitter
-• Facebook
-• Reddit
-• And 1000+ more sites!
-
-Just paste the link and I'll download the video for you.
-    """
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command handler"""
-    help_text = """
-*How to use:*
-
-1. Send any video link
-2. Wait for download
-3. Receive the video file
-
-*Supported platforms:*
-• TikTok
-• Instagram (requires cookies setup)
-• YouTube
-• X/Twitter
-• Facebook
-• Reddit
-• And many more!
-
-*Instagram Setup:*
-For private Instagram content, set INSTAGRAM_COOKIES_BASE64 environment variable with base64-encoded cookies.txt content.
-    """
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-
-async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming URL messages"""
-    message = update.message
-    chat_id = update.effective_chat.id
-    
-    # Get text - handle both direct messages and group mentions
-    text = message.text or ""
-    
-    # In group chats, check if bot was mentioned or if message is a URL
-    bot_username = context.bot.username
-    if message.chat.type in ['group', 'supergroup']:
-        # Remove bot mention from message if present
-        text = text.replace(f"@{bot_username}", "").strip()
-        # Also handle other mentions that might be in the message
-        text = re.sub(r'@\w+\s*', '', text).strip()
-    
-    url = text.strip()
-    
-    # Basic URL validation
-    if not url.startswith(('http://', 'https://')):
-        # Only respond in private chats or when explicitly mentioned in groups
-        if message.chat.type == 'private':
-            await update.message.reply_text("❌ Please send a valid URL starting with http:// or https://")
-        return
-    
-    # Show processing message
-    processing_msg = await update.message.reply_text("🔍 Analyzing link...")
-    
-    # Get cookies path if available
-    cookies_path = get_cookies_path()
-    
-    # Get video info
-    info, error = get_video_info(url, cookies_path)
-    
-    if error:
-        await processing_msg.edit_text(f"❌ Error: {error}")
-        return
-    
-    if not info:
-        await processing_msg.edit_text("❌ Could not fetch video information")
-        return
-    
-    # Extract info
-    title = info.get("title", "Unknown")
-    duration = info.get("duration", 0)
-    uploader = info.get("uploader", "Unknown")
-    platform = detect_platform(url)
-    
-    # Create job
-    job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {
-        "status": "downloading",
-        "url": url,
-        "title": title,
-        "chat_id": chat_id,
-        "message_id": processing_msg.message_id
-    }
-    
-    # Show video info and start download
-    duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
-    
-    info_text = f"""
-🎬 *{title[:100]}*
-👤 {uploader}
-⏱ Duration: {duration_str}
-📱 Platform: {platform.capitalize()}
-
-⬇️ Downloading... Please wait.
-    """
-    
-    await processing_msg.edit_text(info_text, parse_mode="Markdown")
-    
-    # Start download in background thread
-    def download_callback():
-        run_download(job_id, url, "video", cookies_path)
-        # Schedule upload via asyncio
-        asyncio.run_coroutine_threadsafe(
-            upload_video(job_id, context),
-            asyncio.get_event_loop()
-        )
-    
-    thread = threading.Thread(target=download_callback)
-    thread.daemon = True
-    thread.start()
-
-
-async def upload_video(job_id: str, context: ContextTypes.DEFAULT_TYPE):
-    """Upload completed video to Telegram"""
-    job = jobs.get(job_id)
-    if not job:
-        return
-    
-    chat_id = job["chat_id"]
-    message_id = job["message_id"]
-    
-    if job["status"] == "error":
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"❌ Download failed: {job.get('error', 'Unknown error')}"
-        )
-        return
-    
-    if job["status"] != "done":
-        return
-    
-    file_path = job["file"]
-    file_size = job.get("file_size", 0)
-    filename = job["filename"]
-    
-    # Check file size
-    if file_size > MAX_FILE_SIZE:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"❌ File too large ({file_size / 1024 / 1024:.1f}MB). Telegram limit is 50MB.\n\nVideo title: {job.get('title', 'Unknown')}"
-        )
-        # Clean up
+        # Check Telegram size limit
+        if file_size > TELEGRAM_MAX_SIZE:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return None, None, f"❌ Too large ({file_size // 1024 // 1024} MB). Telegram limit is 50 MB"
+        
+        # Get video metadata
+        duration, width, height = await get_video_metadata(final_path)
+        
+        # Get title
+        title = "Video"
         try:
-            os.remove(file_path)
-        except:
-            pass
-        return
-    
-    # Update message
-    await context.bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=f"✅ Download complete! Uploading to Telegram..."
-    )
-    
-    try:
-        # Send video
-        with open(file_path, 'rb') as video_file:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=video_file,
-                caption=f"🎬 {job.get('title', 'Video')[:200]}",
-                supports_streaming=True,
-                filename=filename
+            title_cmd = ["yt-dlp", "--get-title", "--no-warnings", url]
+            if cookies_path:
+                title_cmd.extend(["--cookies", str(cookies_path)])
+            tp = await asyncio.create_subprocess_exec(
+                *title_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-        
-        # Delete the processing message
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        
-    except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"❌ Upload failed: {str(e)}"
-        )
-    finally:
-        # Clean up file
-        try:
-            os.remove(file_path)
+            tout, _ = await asyncio.wait_for(tp.communicate(), timeout=10)
+            title = tout.decode().strip()[:100] if tout else "Video"
         except:
             pass
-        # Clean up job
-        jobs.pop(job_id, None)
+        
+        return final_path, title, (duration, width, height)
+        
+    except asyncio.TimeoutError:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        return None, None, "❌ Download timed out"
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        shutil.rmtree(output_dir, ignore_errors=True)
+        return None, None, f"❌ Download failed: {str(e)}"
 
 
-async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to check active downloads"""
-    if not jobs:
-        await update.message.reply_text("No active downloads")
+async def get_video_metadata(video_path: str):
+    """Get video metadata using ffprobe"""
+    try:
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+               "-show_format", "-show_streams", video_path]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        data = json.loads(stdout.decode())
+        
+        duration = int(float(data.get("format", {}).get("duration", 0)))
+        width, height = 0, 0
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                width = stream.get("width", 0)
+                height = stream.get("height", 0)
+                break
+        return duration, width, height
+    except Exception:
+        return 0, 0, 0
+
+
+def cleanup_media(file_path: str):
+    """Clean up downloaded media and temp directory"""
+    try:
+        if file_path:
+            dir_path = Path(file_path).parent
+            shutil.rmtree(dir_path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+async def cleanup_old_files():
+    """Clean up old download directories"""
+    import time
+    try:
+        for item in DOWNLOAD_DIR.iterdir():
+            if item.is_dir() and time.time() - item.stat().st_mtime > 300:
+                shutil.rmtree(item, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# ============= BOT HANDLERS =============
+
+async def handle_update(update: dict):
+    """Handle incoming Telegram update"""
+    msg = update.get("message", {})
+    text = msg.get("text", "")
+    chat_id = msg.get("chat", {}).get("id")
+    msg_id = msg.get("message_id")
+    
+    if not chat_id or not text:
         return
     
-    status_text = "Active downloads:\n"
-    for job_id, job in jobs.items():
-        status_text += f"• {job_id}: {job['status']} - {job.get('title', 'Unknown')[:30]}\n"
+    # Handle /start command
+    if text.startswith("/start"):
+        await bot_api_send_message(
+            chat_id,
+            "🎬 Video Downloader Bot\n\n"
+            "Send a link from:\n"
+            "• TikTok\n"
+            "• Instagram (with cookies)\n"
+            "• YouTube\n"
+            "• X / Twitter\n"
+            "• Facebook\n"
+            "• Reddit\n\n"
+            "Works in groups — just drop a link.",
+            reply_to=msg_id,
+        )
+        return
     
-    await update.message.reply_text(status_text)
+    # Extract URLs from message
+    urls = extract_urls(text)
+    if not urls:
+        return  # No URLs found, don't respond
+    
+    # Process up to 3 URLs
+    for url in urls[:3]:
+        url_hash = hash(url)
+        if url_hash in processing:
+            continue
+        processing.add(url_hash)
+        
+        try:
+            platform = detect_platform(url)
+            emoji = PLATFORM_EMOJI.get(platform, "🎬")
+            
+            # Send status message
+            status_result = await bot_api_send_message(chat_id, f"{emoji} Downloading…", reply_to=msg_id)
+            status_id = status_result.get("result", {}).get("message_id")
+            
+            # Download using reclip logic
+            file_path, title, metadata = await download_with_reclip(url, platform)
+            
+            if not file_path:
+                # Download failed
+                if status_id:
+                    await bot_api_edit_message(chat_id, status_id, metadata)
+                    asyncio.create_task(delete_later(chat_id, status_id, 15))
+                continue
+            
+            # Success - send the video
+            try:
+                if status_id:
+                    await bot_api_edit_message(chat_id, status_id, "⬆️ Uploading…")
+                
+                duration, width, height = metadata
+                size_mb = Path(file_path).stat().st_size / 1024 / 1024
+                caption = f"{emoji} {title}\n{size_mb:.1f} MB"
+                
+                await bot_api_send_video(
+                    chat_id, file_path, caption, msg_id,
+                    duration=duration, width=width, height=height
+                )
+                
+                # Delete status message after successful upload
+                if status_id:
+                    await bot_api_delete_message(chat_id, status_id)
+                    
+            except Exception as e:
+                logger.error(f"Upload error: {e}")
+                if status_id:
+                    await bot_api_edit_message(chat_id, status_id, "❌ Upload failed")
+                    asyncio.create_task(delete_later(chat_id, status_id, 10))
+            finally:
+                cleanup_media(file_path)
+                
+        finally:
+            processing.discard(url_hash)
 
 
-def main():
-    """Start the bot"""
-    if not TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN environment variable not set")
-        sys.exit(1)
+async def polling_loop():
+    """Main polling loop for updates"""
+    offset = 0
+    session = await get_session()
+    logger.info("Bot polling started")
     
-    # Check if yt-dlp is installed
+    while True:
+        try:
+            url = f"{BOT_API_URL}/getUpdates?offset={offset}&timeout=30"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                data = await resp.json()
+            
+            if not data.get("ok"):
+                logger.error(f"getUpdates error: {data}")
+                await asyncio.sleep(5)
+                continue
+            
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                asyncio.create_task(handle_update(update))
+                
+        except asyncio.TimeoutError:
+            continue
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            await asyncio.sleep(5)
+
+
+async def cleanup_loop():
+    """Background cleanup of old files"""
+    while True:
+        await asyncio.sleep(300)
+        await cleanup_old_files()
+
+
+async def main():
+    """Main entry point"""
+    if not BOT_TOKEN:
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN environment variable")
+    
+    # Check yt-dlp
     try:
         result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
-        print(f"yt-dlp version: {result.stdout.strip()}")
+        logger.info(f"yt-dlp version: {result.stdout.strip()}")
     except FileNotFoundError:
-        print("Error: yt-dlp not found. Please install yt-dlp.")
-        sys.exit(1)
+        raise RuntimeError("yt-dlp not found. Please install yt-dlp.")
     
-    # Check cookies configuration
+    # Log cookie status
     if INSTAGRAM_COOKIES_BASE64:
-        print("✅ Instagram cookies configured")
-    else:
-        print("⚠️ No Instagram cookies configured (set INSTAGRAM_COOKIES_BASE64 env var)")
+        logger.info("✅ Instagram cookies configured")
+    if TIKTOK_COOKIES_BASE64:
+        logger.info("✅ TikTok cookies configured")
+    if TWITTER_COOKIES_BASE64:
+        logger.info("✅ Twitter cookies configured")
     
-    # Create application
-    application = Application.builder().token(TOKEN).build()
+    logger.info("Bot starting (Raw Bot API, 50 MB limit)")
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", check_status))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_url))
-    
-    # Run the bot
-    print("🤖 Bot started!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    asyncio.create_task(cleanup_loop())
+    await polling_loop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
