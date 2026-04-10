@@ -242,18 +242,17 @@ async def download_media(url, platform):
     if cookie:
         opts["cookiefile"] = cookie
 
-    # proxy (not for instagram — breaks cookie session)
-    if platform != "instagram" and PROXIES:
+    # proxy (not for instagram — breaks cookie session, not for youtube — try direct first)
+    if platform not in ("instagram", "youtube") and PROXIES:
         opts["proxy"] = random.choice(PROXIES)
 
     # twitter syndication
     if platform == "twitter":
         opts["extractor_args"] = {"twitter": ["api=syndication"]}
 
-    # youtube: flexible format + player client
+    # youtube: flexible format
     if platform == "youtube":
         opts["format"] = "bv*+ba/b"
-        opts["extractor_args"] = {"youtube": ["player_client=mweb,default"]}
 
     loop = asyncio.get_event_loop()
 
@@ -344,28 +343,45 @@ def _ytdlp_extract(url, opts):
 
 # ── cobalt fallback for YouTube ──
 
+COBALT_INSTANCES = [
+    "https://cobalt.canine.tools",
+    "https://cobalt.aether.icu",
+    "https://api.cobalt.tools",
+]
+
+
 async def cobalt_download(url):
-    """Fallback for YouTube when yt-dlp fails."""
+    """Fallback for YouTube when yt-dlp fails. Tries multiple cobalt instances."""
     job = os.urandom(5).hex()
     out_dir = DL_DIR / job
     out_dir.mkdir(exist_ok=True)
     path = str(out_dir / f"{job}.mp4")
 
     s = await get_session()
+    api_key = os.environ.get("COBALT_API_KEY", "")
+
     try:
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        api_key = os.environ.get("COBALT_API_KEY", "")
-        if api_key:
-            headers["Authorization"] = f"Api-Key {api_key}"
+        dl_url = None
+        for instance in COBALT_INSTANCES:
+            try:
+                headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                if instance == "https://api.cobalt.tools" and api_key:
+                    headers["Authorization"] = f"Api-Key {api_key}"
+                async with s.post(f"{instance}/", json={"url": url, "videoQuality": "720"},
+                                  headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+                dl_url = data.get("url")
+                if dl_url:
+                    log.info("[cobalt] using %s", instance)
+                    break
+                log.warning("[cobalt] %s: %s", instance, data)
+            except Exception as e:
+                log.warning("[cobalt] %s failed: %s", instance, e)
+                continue
 
-        async with s.post("https://api.cobalt.tools/", json={"url": url, "videoQuality": "720"},
-                          headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
-            data = await r.json()
-
-        dl_url = data.get("url")
         if not dl_url:
             shutil.rmtree(out_dir, ignore_errors=True)
-            return None, f"Cobalt: {data.get('error', {}).get('code', 'no url')}"
+            return None, "All cobalt instances failed"
 
         async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
             if r.status != 200:
