@@ -22,12 +22,18 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BOT_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 INSTAGRAM_COOKIES_BASE64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
+YOUTUBE_COOKIES_BASE64 = os.environ.get("YOUTUBE_COOKIES_BASE64", "")
+TWITTER_COOKIES_BASE64 = os.environ.get("TWITTER_COOKIES_BASE64", "")
+TIKTOK_COOKIES_BASE64 = os.environ.get("TIKTOK_COOKIES_BASE64", "")
 
 TELEGRAM_MAX_SIZE = 50 * 1024 * 1024
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "bot_downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-COOKIES_PATH = None
+COOKIES_DIR = DOWNLOAD_DIR / "cookies"
+COOKIES_DIR.mkdir(exist_ok=True)
+
+PLATFORM_COOKIES = {}
 
 http_session: aiohttp.ClientSession = None
 processing = set()
@@ -60,17 +66,23 @@ PLATFORM_EMOJI = {
 
 
 def setup_cookies():
-    global COOKIES_PATH
-    if not INSTAGRAM_COOKIES_BASE64:
-        return
-    try:
-        raw = base64.b64decode(INSTAGRAM_COOKIES_BASE64)
-        p = DOWNLOAD_DIR / "cookies.txt"
-        p.write_bytes(raw)
-        COOKIES_PATH = str(p)
-        logger.info("Instagram cookies written to %s", p)
-    except Exception as e:
-        logger.error("Failed to decode cookies: %s", e)
+    cookie_map = {
+        "instagram": INSTAGRAM_COOKIES_BASE64,
+        "youtube": YOUTUBE_COOKIES_BASE64,
+        "twitter": TWITTER_COOKIES_BASE64,
+        "tiktok": TIKTOK_COOKIES_BASE64,
+    }
+    for platform, b64 in cookie_map.items():
+        if not b64:
+            continue
+        try:
+            raw = base64.b64decode(b64)
+            p = COOKIES_DIR / f"{platform}.txt"
+            p.write_bytes(raw)
+            PLATFORM_COOKIES[platform] = str(p)
+            logger.info("Cookies written for %s", platform)
+        except Exception as e:
+            logger.error("Failed to decode %s cookies: %s", platform, e)
 
 
 setup_cookies()
@@ -182,27 +194,35 @@ async def delete_later(chat_id, mid, delay=10):
 
 async def reclip_download(url):
     """
-    Exact copy of reclip run_download():
+    Reclip run_download() core command (app.py lines 20-29):
       cmd = ["yt-dlp", "--no-playlist", "-o", out_template,
              "-f", "bestvideo+bestaudio/best",
              "--merge-output-format", "mp4"]
       cmd.append(url)
 
-    Only addition: --cookies for Instagram when configured.
+    Additions for server environment:
+      - per-platform cookies from base64 env vars
+      - twitter syndication API to avoid guest token error
     Returns (file_path, title, duration, width, height, error)
     """
     job_id = os.urandom(5).hex()
     out_dir = DOWNLOAD_DIR / job_id
     out_dir.mkdir(exist_ok=True)
     out_template = str(out_dir / f"{job_id}.%(ext)s")
+    platform = detect_platform(url)
 
-    # ── exact reclip command ──
+    # ── reclip command ──
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
     cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
-    # cookies (only extra vs reclip)
-    if COOKIES_PATH:
-        cmd += ["--cookies", COOKIES_PATH]
+    # per-platform cookies
+    cookie_path = PLATFORM_COOKIES.get(platform)
+    if cookie_path:
+        cmd += ["--cookies", cookie_path]
+
+    # twitter needs syndication API on servers (guest token is broken)
+    if platform == "twitter":
+        cmd += ["--extractor-args", "twitter:api=syndication"]
 
     cmd.append(url)
 
@@ -282,8 +302,12 @@ async def ffprobe_meta(path):
 async def get_title(url):
     try:
         cmd = ["yt-dlp", "--get-title", "--no-warnings", "--no-playlist", url]
-        if COOKIES_PATH:
-            cmd += ["--cookies", COOKIES_PATH]
+        platform = detect_platform(url)
+        cookie_path = PLATFORM_COOKIES.get(platform)
+        if cookie_path:
+            cmd += ["--cookies", cookie_path]
+        if platform == "twitter":
+            cmd += ["--extractor-args", "twitter:api=syndication"]
         p = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, _ = await asyncio.wait_for(p.communicate(), timeout=15)
