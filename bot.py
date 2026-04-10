@@ -353,9 +353,14 @@ async def _tiktok_fast(url):
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None
 
-        # check codec — tikwm hdplay can return HEVC which Telegram shows as black screen
+        # check codec — tikwm hdplay can return HEVC/bvc2 which Telegram can't play
         codec = await _get_video_codec(path)
-        if codec and codec not in ("h264", "avc1", "avc"):
+        if codec and codec in ("bvc2", "bvc1", "bytevc1", "bytevc2"):
+            # proprietary codec, can't decode at all — skip to yt-dlp
+            log.info("[tiktok/tikwm] got %s codec, skipping to yt-dlp", codec)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
+        if codec and codec not in ("h264", "avc1", "avc", "vp9", "vp8"):
             log.info("[tiktok/tikwm] codec %s, re-encoding to h264", codec)
             reencoded = str(out_dir / "reencoded.mp4")
             ok = await _reencode_h264(path, reencoded)
@@ -364,7 +369,6 @@ async def _tiktok_fast(url):
                 path = reencoded
                 size = os.path.getsize(path)
             else:
-                # bad codec, can't reencode — fall back to yt-dlp
                 shutil.rmtree(out_dir, ignore_errors=True)
                 return None, None
 
@@ -499,6 +503,10 @@ async def _ytdlp_download(url, platform):
     # twitter syndication
     if platform == "twitter":
         opts["extractor_args"] = {"twitter": ["api=syndication"]}
+
+    # tiktok: only H.264, reject bvc2
+    if platform == "tiktok":
+        opts["format"] = "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc1]/best[vcodec^=avc1]/best"
 
     # youtube: flexible format
     if platform == "youtube":
