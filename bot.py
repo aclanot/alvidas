@@ -4,6 +4,7 @@ import json
 import glob
 import base64
 import shutil
+import random
 import asyncio
 import logging
 import tempfile
@@ -27,6 +28,37 @@ TWITTER_COOKIES_BASE64 = os.environ.get("TWITTER_COOKIES_BASE64", "")
 TIKTOK_COOKIES_BASE64 = os.environ.get("TIKTOK_COOKIES_BASE64", "")
 
 PROXY_URL = os.environ.get("PROXY_URL", "")
+PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
+
+PROXY_POOL = []
+
+
+def setup_proxies():
+    global PROXY_POOL
+    if PROXY_LIST_RAW:
+        for line in PROXY_LIST_RAW.strip().split(","):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(":")
+            if len(parts) == 4:
+                ip, port, user, pw = parts
+                PROXY_POOL.append(f"http://{user}:{pw}@{ip}:{port}")
+            elif line.startswith(("http://", "https://", "socks")):
+                PROXY_POOL.append(line)
+    if PROXY_URL and not PROXY_POOL:
+        PROXY_POOL.append(PROXY_URL)
+    if PROXY_POOL:
+        logger.info("Loaded %d proxies", len(PROXY_POOL))
+
+
+def get_proxy():
+    if PROXY_POOL:
+        return random.choice(PROXY_POOL)
+    return None
+
+
+setup_proxies()
 
 TELEGRAM_MAX_SIZE = 50 * 1024 * 1024
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "bot_downloads"
@@ -222,9 +254,10 @@ async def reclip_download(url):
     if cookie_path:
         cmd += ["--cookies", cookie_path]
 
-    # proxy for YouTube (server IPs get blocked)
-    if PROXY_URL:
-        cmd += ["--proxy", PROXY_URL]
+    # proxy (rotates through pool for YouTube etc)
+    proxy = get_proxy()
+    if proxy:
+        cmd += ["--proxy", proxy]
 
     # twitter needs syndication API on servers (guest token is broken)
     if platform == "twitter":
