@@ -26,6 +26,8 @@ YOUTUBE_COOKIES_BASE64 = os.environ.get("YOUTUBE_COOKIES_BASE64", "")
 TWITTER_COOKIES_BASE64 = os.environ.get("TWITTER_COOKIES_BASE64", "")
 TIKTOK_COOKIES_BASE64 = os.environ.get("TIKTOK_COOKIES_BASE64", "")
 
+PROXY_URL = os.environ.get("PROXY_URL", "")
+
 TELEGRAM_MAX_SIZE = 50 * 1024 * 1024
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "bot_downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -219,6 +221,10 @@ async def reclip_download(url):
     cookie_path = PLATFORM_COOKIES.get(platform)
     if cookie_path:
         cmd += ["--cookies", cookie_path]
+
+    # proxy for YouTube (server IPs get blocked)
+    if PROXY_URL:
+        cmd += ["--proxy", PROXY_URL]
 
     # twitter needs syndication API on servers (guest token is broken)
     if platform == "twitter":
