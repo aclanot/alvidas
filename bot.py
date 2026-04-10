@@ -215,12 +215,200 @@ async def send_media_group(chat, paths, caption, reply):
     return await tg("sendMediaGroup", d, 120)
 
 
+# ── fast paths: direct API downloads (from botik_dodik) ──
+
+async def _twitter_fast(url):
+    """Download Twitter/X via fxtwitter API — instant, no yt-dlp."""
+    m = re.search(r"(?:twitter\.com|x\.com)/(\w+)/status/(\d+)", url)
+    if not m:
+        return None, None
+    username, tweet_id = m.group(1), m.group(2)
+    s = await get_session()
+    try:
+        async with s.get(f"https://api.fxtwitter.com/{username}/status/{tweet_id}",
+                         headers={"User-Agent": "BotikDodik/1.0"},
+                         timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None, None
+            data = await r.json()
+
+        tweet = data.get("tweet", {})
+        if not tweet:
+            return None, None
+        title = (tweet.get("text") or "Tweet")[:100]
+        media = tweet.get("media", {})
+        videos = media.get("videos") or []
+        photos = media.get("photos") or []
+
+        job = os.urandom(5).hex()
+        out_dir = DL_DIR / job
+        out_dir.mkdir(exist_ok=True)
+
+        if videos:
+            video_url = videos[0].get("url", "")
+            if not video_url:
+                return None, None
+            path = str(out_dir / f"{job}.mp4")
+            async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                if vr.status != 200:
+                    return None, None
+                with open(path, "wb") as f:
+                    async for chunk in vr.content.iter_chunked(65536):
+                        f.write(chunk)
+            size = os.path.getsize(path)
+            if size < 1000:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None
+            dur, w, h = await _ffprobe(path)
+            log.info("[twitter/fxtwitter] OK: %s (%d bytes)", title, size)
+            return {"type": "video", "path": path, "title": title,
+                    "duration": dur, "width": w, "height": h,
+                    "size": size, "dir": str(out_dir)}, None
+
+        if photos:
+            photo_paths = []
+            for i, p in enumerate(photos[:10]):
+                img_url = p.get("url", "")
+                if not img_url:
+                    continue
+                try:
+                    async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as pr:
+                        if pr.status != 200:
+                            continue
+                        content = await pr.read()
+                        pp = out_dir / f"photo_{i}.jpg"
+                        pp.write_bytes(content)
+                        photo_paths.append(str(pp))
+                except Exception:
+                    continue
+            if photo_paths:
+                log.info("[twitter/fxtwitter] %d photos", len(photo_paths))
+                return {"type": "photos", "title": title,
+                        "photo_paths": photo_paths, "dir": str(out_dir)}, None
+
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, None
+    except Exception as e:
+        log.warning("[twitter/fxtwitter] %s", e)
+        return None, None
+
+
+async def _tiktok_fast(url):
+    """Download TikTok via tikwm API — much faster than yt-dlp."""
+    s = await get_session()
+    try:
+        async with s.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1},
+                         headers={"User-Agent": "Mozilla/5.0"},
+                         timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return None, None
+            data = await r.json()
+
+        if data.get("code") != 0:
+            return None, None
+
+        vdata = data.get("data", {})
+        title = (vdata.get("title") or "TikTok")[:100]
+
+        job = os.urandom(5).hex()
+        out_dir = DL_DIR / job
+        out_dir.mkdir(exist_ok=True)
+
+        # photo slideshow
+        images = vdata.get("images")
+        if images:
+            photo_paths = []
+            for i, img_url in enumerate(images[:10]):
+                try:
+                    async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as ir:
+                        if ir.status != 200:
+                            continue
+                        pp = out_dir / f"photo_{i}.jpg"
+                        pp.write_bytes(await ir.read())
+                        photo_paths.append(str(pp))
+                except Exception:
+                    continue
+            if photo_paths:
+                log.info("[tiktok/tikwm] %d photos", len(photo_paths))
+                return {"type": "photos", "title": title,
+                        "photo_paths": photo_paths, "dir": str(out_dir)}, None
+
+        # video
+        video_url = vdata.get("hdplay") or vdata.get("play") or vdata.get("wmplay")
+        if not video_url:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
+
+        path = str(out_dir / f"{job}.mp4")
+        async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+            if vr.status != 200:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None
+            with open(path, "wb") as f:
+                async for chunk in vr.content.iter_chunked(65536):
+                    f.write(chunk)
+
+        size = os.path.getsize(path)
+        if size < 1000:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
+
+        dur, w, h = await _ffprobe(path)
+        log.info("[tiktok/tikwm] OK: %s (%d bytes)", title, size)
+        return {"type": "video", "path": path, "title": title,
+                "duration": dur, "width": w, "height": h,
+                "size": size, "dir": str(out_dir)}, None
+
+    except Exception as e:
+        log.warning("[tiktok/tikwm] %s", e)
+        return None, None
+
+
+async def _ffprobe(path):
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        data = json.loads(out)
+        dur = int(float(data.get("format", {}).get("duration", 0)))
+        w = h = 0
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                w, h = s.get("width", 0), s.get("height", 0)
+                break
+        return dur, w, h
+    except Exception:
+        return 0, 0, 0
+
+
 # ── download with yt-dlp as Python library (from yt-dlp-telegram) ──
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 async def download_media(url, platform):
+    """
+    Fast path first (direct API), then yt-dlp fallback.
+    """
+    # Twitter: try fxtwitter API first (instant)
+    if platform == "twitter":
+        result, err = await _twitter_fast(url)
+        if result:
+            return result, None
+
+    # TikTok: try tikwm API first (faster)
+    if platform == "tiktok":
+        result, err = await _tiktok_fast(url)
+        if result:
+            return result, None
+
+    # Fallback: yt-dlp for everything
+    return await _ytdlp_download(url, platform)
+
+
+async def _ytdlp_download(url, platform):
     """
     Download using yt-dlp Python library.
     Combines yt-dlp-telegram (library usage, js_runtime) with botik_dodik (async, platform handling).
