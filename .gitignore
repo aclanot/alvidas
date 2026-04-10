@@ -1,16 +1,6 @@
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
 .env
-.venv
-env/
-venv/
-ENV/
 downloads/
 *.mp4
 *.mp3
-*.webm
-cookies.txt
-*.log
-.DS_Store

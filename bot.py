@@ -9,428 +9,158 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
 
 import aiohttp
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger("bot")
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BOT_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# ── config ──
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-INSTAGRAM_COOKIES_BASE64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
-YOUTUBE_COOKIES_BASE64 = os.environ.get("YOUTUBE_COOKIES_BASE64", "")
-TWITTER_COOKIES_BASE64 = os.environ.get("TWITTER_COOKIES_BASE64", "")
-TIKTOK_COOKIES_BASE64 = os.environ.get("TIKTOK_COOKIES_BASE64", "")
-
-PROXY_URL = os.environ.get("PROXY_URL", "")
+INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
 PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
 
-PROXY_POOL = []
+MAX_TG_SIZE = 50 * 1024 * 1024
+DL_DIR = Path(tempfile.gettempdir()) / "downloads"
+DL_DIR.mkdir(exist_ok=True)
+COOKIE_FILE = DL_DIR / "instagram_cookies.txt"
 
+# ── proxies ──
+PROXIES = []
+for entry in PROXY_LIST_RAW.split(","):
+    entry = entry.strip()
+    if not entry:
+        continue
+    parts = entry.split(":")
+    if len(parts) == 4:
+        PROXIES.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+    elif entry.startswith(("http", "socks")):
+        PROXIES.append(entry)
 
-def setup_proxies():
-    global PROXY_POOL
-    if PROXY_LIST_RAW:
-        for line in PROXY_LIST_RAW.strip().split(","):
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(":")
-            if len(parts) == 4:
-                ip, port, user, pw = parts
-                PROXY_POOL.append(f"http://{user}:{pw}@{ip}:{port}")
-            elif line.startswith(("http://", "https://", "socks")):
-                PROXY_POOL.append(line)
-    if PROXY_URL and not PROXY_POOL:
-        PROXY_POOL.append(PROXY_URL)
-    if PROXY_POOL:
-        logger.info("Loaded %d proxies", len(PROXY_POOL))
+# ── instagram cookies ──
+if INSTAGRAM_COOKIES_B64:
+    try:
+        raw = base64.b64decode(INSTAGRAM_COOKIES_B64)
+        text = raw.decode("utf-8-sig").replace("\r\n", "\n")
+        if not text.startswith("# Netscape"):
+            text = "# Netscape HTTP Cookie File\n\n" + text
+        COOKIE_FILE.write_text(text, encoding="utf-8")
+        log.info("Instagram cookies: %d bytes, sessionid=%s", len(text), "sessionid" in text)
+    except Exception as e:
+        log.error("Bad Instagram cookies: %s", e)
+        COOKIE_FILE = None
+else:
+    COOKIE_FILE = None
 
-
-def get_proxy():
-    if PROXY_POOL:
-        return random.choice(PROXY_POOL)
-    return None
-
-
-setup_proxies()
-
-TELEGRAM_MAX_SIZE = 50 * 1024 * 1024
-DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "bot_downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-COOKIES_DIR = DOWNLOAD_DIR / "cookies"
-COOKIES_DIR.mkdir(exist_ok=True)
-
-PLATFORM_COOKIES = {}
-
-http_session: aiohttp.ClientSession = None
-processing = set()
-
-URL_PATTERNS = [
-    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[@\w./]+",
-    r"https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+",
-    r"https?://(?:www\.)?tiktok\.com/@[\w.]+/photo/\d+",
-    r"https?://(?:www\.)?youtube\.com/shorts/[\w-]+",
-    r"https?://(?:www\.)?youtu\.be/[\w-]+",
-    r"https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+",
-    r"https?://music\.youtube\.com/watch\?v=[\w-]+",
-    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+",
-    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/[\w-]+",
-    r"https?://(?:www\.)?facebook\.com/(?:watch/\?v=|share/v/|reel/)[\w-]+",
-    r"https?://(?:www\.)?fb\.watch/[\w-]+",
-    r"https?://(?:www\.)?reddit\.com/r/\w+/comments/\w+",
-    r"https?://(?:www\.)?redd\.it/\w+",
-]
-
-PLATFORM_EMOJI = {
-    "tiktok": "\U0001f3b5",
-    "youtube": "\u25b6\ufe0f",
-    "twitter": "\U0001d54f",
-    "instagram": "\U0001f4f7",
-    "facebook": "\U0001f4d8",
-    "reddit": "\U0001f916",
-    "unknown": "\U0001f3ac",
+# ── url detection ──
+PATTERNS = {
+    "tiktok": [
+        r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+",
+    ],
+    "instagram": [
+        r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/[\w-]+",
+    ],
+    "twitter": [
+        r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+",
+    ],
+    "youtube": [
+        r"https?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)[\w-]+",
+        r"https?://youtu\.be/[\w-]+",
+        r"https?://music\.youtube\.com/watch\?v=[\w-]+",
+    ],
 }
 
+EMOJI = {"tiktok": "\U0001f3b5", "instagram": "\U0001f4f7", "twitter": "\U0001d54f", "youtube": "\u25b6\ufe0f"}
 
-def setup_cookies():
-    cookie_map = {
-        "instagram": INSTAGRAM_COOKIES_BASE64,
-        "youtube": YOUTUBE_COOKIES_BASE64,
-        "twitter": TWITTER_COOKIES_BASE64,
-        "tiktok": TIKTOK_COOKIES_BASE64,
-    }
-    for platform, b64 in cookie_map.items():
-        if not b64:
-            continue
-        try:
-            raw = base64.b64decode(b64)
-            content = raw.decode("utf-8-sig", errors="replace")
-            content = content.replace("\r\n", "\n").replace("\r", "\n")
-            if not content.startswith("# Netscape HTTP Cookie File"):
-                content = "# Netscape HTTP Cookie File\n# https://curl.haxx.se/rfc/cookie_spec.html\n# This is a generated file! Do not edit.\n\n" + content
-            p = COOKIES_DIR / f"{platform}.txt"
-            p.write_text(content, encoding="utf-8")
-            PLATFORM_COOKIES[platform] = str(p)
-            lines = [l for l in content.strip().splitlines() if l.strip() and not l.startswith("#")]
-            has_sessionid = "sessionid" in content
-            logger.info(
-                "Cookies for %s: %d bytes, %d data lines, sessionid=%s, first_line=%r, path=%s",
-                platform, len(content), len(lines), has_sessionid,
-                lines[0][:80] if lines else "EMPTY", p,
-            )
-        except Exception as e:
-            logger.error("Failed to decode %s cookies: %s", platform, e)
+session: aiohttp.ClientSession = None
+busy = set()
 
-
-setup_cookies()
-
-
-def detect_platform(url):
-    d = urlparse(url).netloc.lower()
-    if "tiktok" in d:
-        return "tiktok"
-    if "instagram" in d:
-        return "instagram"
-    if "youtube" in d or "youtu.be" in d:
-        return "youtube"
-    if "twitter" in d or "x.com" in d:
-        return "twitter"
-    if "facebook" in d or "fb.watch" in d:
-        return "facebook"
-    if "reddit" in d or "redd.it" in d:
-        return "reddit"
-    return "unknown"
-
-
-def extract_urls(text):
-    urls = []
-    for pattern in URL_PATTERNS:
-        for m in re.finditer(pattern, text, re.IGNORECASE):
-            u = m.group(0)
-            if u not in urls:
-                urls.append(u)
-    return urls
-
-
-# ──────────────────────────────────────────────
-#  Telegram Bot API helpers (raw aiohttp)
-# ──────────────────────────────────────────────
 
 async def get_session():
-    global http_session
-    if http_session is None or http_session.closed:
-        http_session = aiohttp.ClientSession()
-    return http_session
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    return session
 
 
-async def api(method, data, timeout=120):
+def find_urls(text):
+    found = []
+    for platform, pats in PATTERNS.items():
+        for pat in pats:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                url = m.group(0)
+                if url not in found:
+                    found.append((platform, url))
+    return found
+
+
+# ── telegram helpers ──
+
+async def tg(method, data, timeout=120):
     s = await get_session()
-    async with s.post(f"{BOT_API_URL}/{method}", data=data,
-                      timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+    async with s.post(f"{API}/{method}", data=data, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
         res = await r.json()
         if not res.get("ok"):
-            raise Exception(res.get("description", f"{method} failed"))
+            raise Exception(res.get("description", method))
         return res
 
 
-async def send_msg(chat_id, text, reply_to=None):
+async def send_text(chat, text, reply=None):
     d = aiohttp.FormData()
-    d.add_field("chat_id", str(chat_id))
+    d.add_field("chat_id", str(chat))
     d.add_field("text", text)
-    if reply_to:
-        d.add_field("reply_to_message_id", str(reply_to))
-    return await api("sendMessage", d, 30)
+    if reply:
+        d.add_field("reply_to_message_id", str(reply))
+    return await tg("sendMessage", d, 30)
 
 
-async def edit_msg(chat_id, mid, text):
+async def edit_text(chat, mid, text):
     d = aiohttp.FormData()
-    d.add_field("chat_id", str(chat_id))
+    d.add_field("chat_id", str(chat))
     d.add_field("message_id", str(mid))
     d.add_field("text", text)
-    return await api("editMessageText", d, 30)
+    return await tg("editMessageText", d, 30)
 
 
-async def del_msg(chat_id, mid):
+async def delete_msg(chat, mid):
     d = aiohttp.FormData()
-    d.add_field("chat_id", str(chat_id))
+    d.add_field("chat_id", str(chat))
     d.add_field("message_id", str(mid))
     try:
-        return await api("deleteMessage", d, 30)
+        await tg("deleteMessage", d, 10)
     except Exception:
         pass
 
 
-async def send_video(chat_id, fp, caption, reply_to, dur=0, w=0, h=0):
+async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
     d = aiohttp.FormData()
-    d.add_field("chat_id", str(chat_id))
-    d.add_field("video", open(fp, "rb"), filename="video.mp4",
-                content_type="video/mp4")
-    if caption:
-        d.add_field("caption", caption[:1024])
-    if reply_to:
-        d.add_field("reply_to_message_id", str(reply_to))
+    d.add_field("chat_id", str(chat))
+    d.add_field("video", open(path, "rb"), filename="video.mp4", content_type="video/mp4")
+    d.add_field("caption", caption[:1024])
+    d.add_field("supports_streaming", "true")
+    if reply:
+        d.add_field("reply_to_message_id", str(reply))
     if dur:
         d.add_field("duration", str(dur))
     if w:
         d.add_field("width", str(w))
     if h:
         d.add_field("height", str(h))
-    d.add_field("supports_streaming", "true")
-    return await api("sendVideo", d, 120)
+    return await tg("sendVideo", d, 180)
 
 
-async def delete_later(chat_id, mid, delay=10):
-    await asyncio.sleep(delay)
-    await del_msg(chat_id, mid)
+# ── ffprobe ──
 
-
-# ──────────────────────────────────────────────
-#  Cobalt API fallback for YouTube
-# ──────────────────────────────────────────────
-
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-]
-COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "")
-
-
-async def cobalt_download(url, out_dir, job_id):
-    """Fallback: download YouTube via cobalt API when yt-dlp fails on server"""
-    out_dir.mkdir(exist_ok=True)
-    session = await get_session()
-
-    for instance in COBALT_INSTANCES:
-        try:
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-            if COBALT_API_KEY:
-                headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
-
-            payload = {"url": url, "videoQuality": "720"}
-            async with session.post(
-                f"{instance}/",
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                data = await resp.json()
-
-            dl_url = data.get("url")
-            if not dl_url:
-                logger.error("Cobalt no URL: %s", data)
-                continue
-
-            # download the file
-            final_path = str(out_dir / f"{job_id}.mp4")
-            async with session.get(dl_url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                if resp.status != 200:
-                    continue
-                with open(final_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(65536):
-                        f.write(chunk)
-
-            fsize = os.path.getsize(final_path)
-            if fsize < 1000:
-                os.remove(final_path)
-                continue
-
-            if fsize > TELEGRAM_MAX_SIZE:
-                shutil.rmtree(out_dir, ignore_errors=True)
-                return None, None, 0, 0, 0, f"File too large ({fsize // 1048576} MB > 50 MB)"
-
-            dur, w, h = await ffprobe_meta(final_path)
-            title = data.get("filename", "Video").rsplit(".", 1)[0][:100]
-            logger.info("Cobalt download OK: %s", title)
-            return final_path, title, dur, w, h, None
-
-        except Exception as e:
-            logger.error("Cobalt error (%s): %s", instance, e)
-            continue
-
-    return None
-
-
-# ──────────────────────────────────────────────
-#  RECLIP download logic  (app.py lines 16-73)
-#  Exact same command, made async
-# ──────────────────────────────────────────────
-
-async def reclip_download(url):
-    """
-    Reclip run_download() core command (app.py lines 20-29):
-      cmd = ["yt-dlp", "--no-playlist", "-o", out_template,
-             "-f", "bestvideo+bestaudio/best",
-             "--merge-output-format", "mp4"]
-      cmd.append(url)
-
-    Additions for server environment:
-      - per-platform cookies from base64 env vars
-      - twitter syndication API to avoid guest token error
-    Returns (file_path, title, duration, width, height, error)
-    """
-    job_id = os.urandom(5).hex()
-    out_dir = DOWNLOAD_DIR / job_id
-    out_dir.mkdir(exist_ok=True)
-    out_template = str(out_dir / f"{job_id}.%(ext)s")
-    platform = detect_platform(url)
-
-    # ── reclip command ──
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
-    # verbose for instagram to debug cookie issues
-    if platform == "instagram":
-        cmd += ["--verbose"]
-
-    # format: reclip default, but flexible fallback for server clients
-    if platform == "youtube":
-        cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    # per-platform cookies
-    cookie_path = PLATFORM_COOKIES.get(platform)
-    if cookie_path:
-        cmd += ["--cookies", cookie_path]
-
-    # proxy only for platforms that need it (NOT instagram — proxy IP breaks cookies)
-    if platform not in ("instagram",):
-        proxy = get_proxy()
-        if proxy:
-            cmd += ["--proxy", proxy]
-
-    # youtube: try multiple player clients to bypass bot detection
-    if platform == "youtube":
-        cmd += ["--extractor-args", "youtube:player_client=mweb,default"]
-
-    # twitter needs syndication API on servers (guest token is broken)
-    if platform == "twitter":
-        cmd += ["--extractor-args", "twitter:api=syndication"]
-
-    cmd.append(url)
-
+async def probe(path):
     try:
-        logger.info("yt-dlp: %s", " ".join(cmd))
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-
-        if proc.returncode != 0:
-            full_err = stderr.decode().strip() if stderr else ""
-            err = full_err.split("\n")[-1] if full_err else "unknown"
-            if platform == "instagram":
-                logger.error("yt-dlp Instagram FULL stderr:\n%s", full_err[-2000:])
-            else:
-                logger.error("yt-dlp error: %s", err)
-
-            # YouTube fallback: try cobalt API
-            if platform == "youtube":
-                logger.info("Trying cobalt fallback for YouTube: %s", url)
-                cobalt_result = await cobalt_download(url, out_dir, job_id)
-                if cobalt_result:
-                    return cobalt_result
-
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None, 0, 0, 0, err
-
-        # ── exact reclip file selection ──
-        files = glob.glob(str(out_dir / f"{job_id}.*"))
-        if not files:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None, 0, 0, 0, "Download completed but no file was found"
-
-        target = [f for f in files if f.endswith(".mp4")]
-        chosen = target[0] if target else files[0]
-
-        for f in files:
-            if f != chosen:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        # size check
-        fsize = os.path.getsize(chosen)
-        if fsize > TELEGRAM_MAX_SIZE:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None, 0, 0, 0, f"File too large ({fsize // 1048576} MB > 50 MB limit)"
-
-        # metadata
-        dur, w, h = await ffprobe_meta(chosen)
-
-        # title
-        title = await get_title(url)
-
-        return chosen, title, dur, w, h, None
-
-    except asyncio.TimeoutError:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return None, None, 0, 0, 0, "Download timed out (5 min limit)"
-    except Exception as e:
-        logger.error("Download exception: %s", e)
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return None, None, 0, 0, 0, str(e)
-
-
-async def ffprobe_meta(path):
-    try:
-        proc = await asyncio.create_subprocess_exec(
+        p = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_format", "-show_streams", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        data = json.loads(out.decode())
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        data = json.loads(out)
         dur = int(float(data.get("format", {}).get("duration", 0)))
         w = h = 0
         for s in data.get("streams", []):
@@ -442,148 +172,289 @@ async def ffprobe_meta(path):
         return 0, 0, 0
 
 
-async def get_title(url):
+# ── download: yt-dlp (reclip style) ──
+
+async def ytdlp_download(url, platform):
+    """
+    Core download — same as reclip app.py:
+      yt-dlp --no-playlist -f bestvideo+bestaudio/best --merge-output-format mp4
+    """
+    job = os.urandom(5).hex()
+    out_dir = DL_DIR / job
+    out_dir.mkdir(exist_ok=True)
+    tmpl = str(out_dir / f"{job}.%(ext)s")
+
+    cmd = ["yt-dlp", "--no-playlist", "-o", tmpl, "--no-warnings",
+           "-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+
+    # instagram: cookies, no proxy
+    if platform == "instagram":
+        if COOKIE_FILE and COOKIE_FILE.exists():
+            cmd += ["--cookies", str(COOKIE_FILE)]
+
+    # twitter: syndication api (fixes guest token error on servers)
+    if platform == "twitter":
+        cmd += ["--extractor-args", "twitter:api=syndication"]
+
+    # youtube: flexible format + mweb client (bypasses bot check)
+    if platform == "youtube":
+        cmd = ["yt-dlp", "--no-playlist", "-o", tmpl, "--no-warnings",
+               "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+               "--extractor-args", "youtube:player_client=mweb,default"]
+
+    # proxy for everything except instagram (proxy IP breaks cookie session)
+    if platform != "instagram" and PROXIES:
+        cmd += ["--proxy", random.choice(PROXIES)]
+
+    cmd.append(url)
+    log.info("[%s] %s", platform, " ".join(cmd))
+
     try:
-        cmd = ["yt-dlp", "--get-title", "--no-warnings", "--no-playlist", url]
-        platform = detect_platform(url)
-        cookie_path = PLATFORM_COOKIES.get(platform)
-        if cookie_path:
-            cmd += ["--cookies", cookie_path]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await asyncio.wait_for(proc.communicate(), 300)
+
+        if proc.returncode != 0:
+            err = stderr.decode().strip().split("\n")[-1] if stderr else "unknown error"
+            log.error("[%s] yt-dlp failed: %s", platform, err)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, err
+
+        # find downloaded file (reclip logic)
+        files = glob.glob(str(out_dir / f"{job}.*"))
+        if not files:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "No file found after download"
+
+        mp4 = [f for f in files if f.endswith(".mp4")]
+        chosen = mp4[0] if mp4 else files[0]
+        for f in files:
+            if f != chosen:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+        size = os.path.getsize(chosen)
+        if size > MAX_TG_SIZE:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, f"Too large ({size // 1048576} MB, limit 50 MB)"
+
+        return chosen, None
+
+    except asyncio.TimeoutError:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, "Download timed out"
+    except Exception as e:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, str(e)
+
+
+# ── download: cobalt fallback for youtube ──
+
+async def cobalt_download(url):
+    """Fallback for YouTube when yt-dlp fails on server IPs."""
+    job = os.urandom(5).hex()
+    out_dir = DL_DIR / job
+    out_dir.mkdir(exist_ok=True)
+    path = str(out_dir / f"{job}.mp4")
+
+    s = await get_session()
+    try:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        api_key = os.environ.get("COBALT_API_KEY", "")
+        if api_key:
+            headers["Authorization"] = f"Api-Key {api_key}"
+
+        async with s.post("https://api.cobalt.tools/", json={"url": url, "videoQuality": "720"},
+                          headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            data = await r.json()
+
+        dl_url = data.get("url")
+        if not dl_url:
+            log.error("[cobalt] no url: %s", data)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "Cobalt API returned no URL"
+
+        async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+            if r.status != 200:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, f"Cobalt download HTTP {r.status}"
+            with open(path, "wb") as f:
+                async for chunk in r.content.iter_chunked(65536):
+                    f.write(chunk)
+
+        size = os.path.getsize(path)
+        if size < 1000:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "Cobalt returned empty file"
+        if size > MAX_TG_SIZE:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, f"Too large ({size // 1048576} MB, limit 50 MB)"
+
+        log.info("[cobalt] OK: %d bytes", size)
+        return path, None
+
+    except Exception as e:
+        log.error("[cobalt] error: %s", e)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, str(e)
+
+
+# ── get title ──
+
+async def get_title(url, platform):
+    try:
+        cmd = ["yt-dlp", "--get-title", "--no-warnings", "--no-playlist"]
+        if platform == "instagram" and COOKIE_FILE and COOKIE_FILE.exists():
+            cmd += ["--cookies", str(COOKIE_FILE)]
         if platform == "twitter":
             cmd += ["--extractor-args", "twitter:api=syndication"]
+        if platform == "youtube":
+            cmd += ["--extractor-args", "youtube:player_client=mweb,default"]
+        if platform != "instagram" and PROXIES:
+            cmd += ["--proxy", random.choice(PROXIES)]
+        cmd.append(url)
         p = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _ = await asyncio.wait_for(p.communicate(), timeout=15)
+        out, _ = await asyncio.wait_for(p.communicate(), 15)
         t = out.decode().strip()[:100]
         return t if t else "Video"
     except Exception:
         return "Video"
 
 
-# ──────────────────────────────────────────────
-#  Bot update handler
-# ──────────────────────────────────────────────
+# ── main download router ──
 
-async def handle_update(update):
+async def download(url, platform):
+    """Try yt-dlp first. For YouTube, fall back to cobalt if yt-dlp fails."""
+    path, err = await ytdlp_download(url, platform)
+
+    if err and platform == "youtube":
+        log.info("[youtube] yt-dlp failed, trying cobalt: %s", url)
+        path, err = await cobalt_download(url)
+
+    return path, err
+
+
+# ── handle message ──
+
+async def handle(update):
     msg = update.get("message", {})
     text = msg.get("text", "")
-    chat_id = msg.get("chat", {}).get("id")
-    msg_id = msg.get("message_id")
-    if not chat_id or not text:
+    chat = msg.get("chat", {}).get("id")
+    mid = msg.get("message_id")
+    if not chat or not text:
         return
 
     if text.startswith("/start"):
-        await send_msg(
-            chat_id,
+        await send_text(chat, (
             "\U0001f3ac Video Downloader\n\n"
             "Send a link from:\n"
             "\u2022 TikTok\n"
             "\u2022 Instagram\n"
             "\u2022 YouTube\n"
-            "\u2022 X / Twitter\n"
-            "\u2022 Facebook, Reddit, etc.\n\n"
-            "Works in groups \u2014 just drop a link.",
-            reply_to=msg_id)
+            "\u2022 X / Twitter\n\n"
+            "Works in groups \u2014 just drop a link."
+        ), mid)
         return
 
-    urls = extract_urls(text)
+    urls = find_urls(text)
     if not urls:
         return
 
-    for url in urls[:3]:
-        h = hash(url)
-        if h in processing:
+    for platform, url in urls[:3]:
+        key = hash(url)
+        if key in busy:
             continue
-        processing.add(h)
+        busy.add(key)
+
         try:
-            platform = detect_platform(url)
-            emoji = PLATFORM_EMOJI.get(platform, "\U0001f3ac")
+            emoji = EMOJI.get(platform, "\U0001f3ac")
 
-            st = await send_msg(chat_id, f"{emoji} Downloading\u2026", reply_to=msg_id)
-            sid = st.get("result", {}).get("message_id")
+            # status message
+            res = await send_text(chat, f"{emoji} Downloading\u2026", mid)
+            sid = res.get("result", {}).get("message_id")
 
-            fp, title, dur, w, ht, err = await reclip_download(url)
+            # download
+            path, err = await download(url, platform)
 
             if err:
                 if sid:
-                    await edit_msg(chat_id, sid, f"\u274c {err[:300]}")
-                    asyncio.create_task(delete_later(chat_id, sid, 15))
+                    await edit_text(chat, sid, f"\u274c {err[:300]}")
+                    asyncio.create_task(_delete_later(chat, sid, 15))
                 continue
 
+            # get metadata
+            title = await get_title(url, platform)
+            dur, w, h = await probe(path)
+            size_mb = os.path.getsize(path) / 1048576
+
+            # upload
             try:
                 if sid:
-                    await edit_msg(chat_id, sid, "\u2b06\ufe0f Uploading\u2026")
-
-                size_mb = os.path.getsize(fp) / 1048576
-                cap = f"{emoji} {title}\n{size_mb:.1f} MB"
-                await send_video(chat_id, fp, cap, msg_id, dur, w, ht)
-
+                    await edit_text(chat, sid, "\u2b06\ufe0f Uploading\u2026")
+                await send_video(chat, path, f"{emoji} {title}\n{size_mb:.1f} MB", mid, dur, w, h)
                 if sid:
-                    await del_msg(chat_id, sid)
+                    await delete_msg(chat, sid)
             except Exception as e:
-                logger.error("Upload error: %s", e)
+                log.error("Upload error: %s", e)
                 if sid:
-                    try:
-                        await edit_msg(chat_id, sid, "\u274c Upload failed")
-                    except Exception:
-                        pass
-                    asyncio.create_task(delete_later(chat_id, sid, 10))
+                    await edit_text(chat, sid, "\u274c Upload failed")
+                    asyncio.create_task(_delete_later(chat, sid, 15))
             finally:
-                try:
-                    shutil.rmtree(Path(fp).parent, ignore_errors=True)
-                except Exception:
-                    pass
+                shutil.rmtree(Path(path).parent, ignore_errors=True)
+
         finally:
-            processing.discard(h)
+            busy.discard(key)
 
 
-# ──────────────────────────────────────────────
-#  Polling
-# ──────────────────────────────────────────────
+async def _delete_later(chat, mid, delay):
+    await asyncio.sleep(delay)
+    await delete_msg(chat, mid)
 
-async def polling_loop():
+
+# ── polling ──
+
+async def poll():
     offset = 0
     s = await get_session()
-    logger.info("Polling started")
+    log.info("Polling started")
     while True:
         try:
-            async with s.get(
-                f"{BOT_API_URL}/getUpdates?offset={offset}&timeout=30",
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as r:
+            async with s.get(f"{API}/getUpdates?offset={offset}&timeout=30",
+                             timeout=aiohttp.ClientTimeout(total=60)) as r:
                 data = await r.json()
             if not data.get("ok"):
-                logger.error("getUpdates: %s", data)
+                log.error("getUpdates: %s", data)
                 await asyncio.sleep(5)
                 continue
             for u in data.get("result", []):
                 offset = u["update_id"] + 1
-                asyncio.create_task(handle_update(u))
+                asyncio.create_task(handle(u))
         except asyncio.TimeoutError:
             continue
         except Exception as e:
-            logger.error("Poll error: %s", e)
+            log.error("Poll: %s", e)
             await asyncio.sleep(5)
 
 
-async def cleanup_loop():
+async def cleanup():
     import time
     while True:
         await asyncio.sleep(300)
         try:
-            for item in DOWNLOAD_DIR.iterdir():
-                if item.is_dir() and time.time() - item.stat().st_mtime > 300:
-                    shutil.rmtree(item, ignore_errors=True)
+            for d in DL_DIR.iterdir():
+                if d.is_dir() and time.time() - d.stat().st_mtime > 300:
+                    shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass
 
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN")
-    logger.info("Bot starting")
-    asyncio.create_task(cleanup_loop())
-    await polling_loop()
+    log.info("Bot starting")
+    asyncio.create_task(cleanup())
+    await poll()
 
 
 if __name__ == "__main__":
