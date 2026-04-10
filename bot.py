@@ -111,16 +111,19 @@ def setup_cookies():
             continue
         try:
             raw = base64.b64decode(b64)
+            content = raw.decode("utf-8-sig", errors="replace")
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            if not content.startswith("# Netscape HTTP Cookie File"):
+                content = "# Netscape HTTP Cookie File\n# https://curl.haxx.se/rfc/cookie_spec.html\n# This is a generated file! Do not edit.\n\n" + content
             p = COOKIES_DIR / f"{platform}.txt"
-            p.write_bytes(raw)
+            p.write_text(content, encoding="utf-8")
             PLATFORM_COOKIES[platform] = str(p)
-            # verify cookie file
-            content = raw.decode("utf-8", errors="replace")
             lines = [l for l in content.strip().splitlines() if l.strip() and not l.startswith("#")]
             has_sessionid = "sessionid" in content
             logger.info(
-                "Cookies for %s: %d bytes, %d data lines, sessionid=%s, path=%s",
-                platform, len(raw), len(lines), has_sessionid, p,
+                "Cookies for %s: %d bytes, %d data lines, sessionid=%s, first_line=%r, path=%s",
+                platform, len(content), len(lines), has_sessionid,
+                lines[0][:80] if lines else "EMPTY", p,
             )
         except Exception as e:
             logger.error("Failed to decode %s cookies: %s", platform, e)
@@ -323,6 +326,10 @@ async def reclip_download(url):
     # ── reclip command ──
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
 
+    # verbose for instagram to debug cookie issues
+    if platform == "instagram":
+        cmd += ["--verbose"]
+
     # format: reclip default, but flexible fallback for server clients
     if platform == "youtube":
         cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
@@ -360,8 +367,12 @@ async def reclip_download(url):
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
 
         if proc.returncode != 0:
-            err = stderr.decode().strip().split("\n")[-1] if stderr else "unknown"
-            logger.error("yt-dlp error: %s", err)
+            full_err = stderr.decode().strip() if stderr else ""
+            err = full_err.split("\n")[-1] if full_err else "unknown"
+            if platform == "instagram":
+                logger.error("yt-dlp Instagram FULL stderr:\n%s", full_err[-2000:])
+            else:
+                logger.error("yt-dlp error: %s", err)
 
             # YouTube fallback: try cobalt API
             if platform == "youtube":
