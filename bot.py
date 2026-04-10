@@ -66,13 +66,24 @@ for platform, b64 in COOKIE_ENV.items():
         else:
             text = raw.decode("latin-1")
         text = text.replace("\r\n", "\n")
+        # fix cookies exported with spaces instead of tabs
+        fixed_lines = []
+        for line in text.split("\n"):
+            if line.startswith("#") or not line.strip():
+                fixed_lines.append(line)
+            elif "\t" not in line and "  " in line:
+                fixed_lines.append(re.sub(r"  +", "\t", line))
+            else:
+                fixed_lines.append(line)
+        text = "\n".join(fixed_lines)
         if not text.startswith("# Netscape"):
             text = "# Netscape HTTP Cookie File\n\n" + text
         p = COOKIE_DIR / f"{platform}.txt"
         p.write_text(text, encoding="utf-8")
         COOKIES[platform] = str(p)
-        has_sid = "sessionid" in text
-        log.info("Cookies %s: %d bytes, sessionid=%s", platform, len(text), has_sid)
+        data_lines = [l for l in text.split("\n") if l.strip() and not l.startswith("#")]
+        tabs_ok = all("\t" in l for l in data_lines)
+        log.info("Cookies %s: %d lines, tabs=%s, path=%s", platform, len(data_lines), tabs_ok, p)
     except Exception as e:
         log.error("Cookie error %s: %s", platform, e)
 
@@ -501,10 +512,9 @@ async def handle(update):
             # download
             result, err = await download_media(url, platform)
 
-            # YouTube fallback to Piped API
+            # YouTube: no fallback — needs cookies
             if err and platform == "youtube":
-                log.info("[youtube] trying Piped fallback")
-                result, err = await piped_download(url)
+                err = "YouTube blocked this server. Set YOUTUBE_COOKIES_BASE64 env var."
 
             if err:
                 if sid:
