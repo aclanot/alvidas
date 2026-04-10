@@ -222,6 +222,74 @@ async def delete_later(chat_id, mid, delay=10):
 
 
 # ──────────────────────────────────────────────
+#  Cobalt API fallback for YouTube
+# ──────────────────────────────────────────────
+
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+]
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "")
+
+
+async def cobalt_download(url, out_dir, job_id):
+    """Fallback: download YouTube via cobalt API when yt-dlp fails on server"""
+    out_dir.mkdir(exist_ok=True)
+    session = await get_session()
+
+    for instance in COBALT_INSTANCES:
+        try:
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            if COBALT_API_KEY:
+                headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+
+            payload = {"url": url, "videoQuality": "720"}
+            async with session.post(
+                f"{instance}/",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+
+            dl_url = data.get("url")
+            if not dl_url:
+                logger.error("Cobalt no URL: %s", data)
+                continue
+
+            # download the file
+            final_path = str(out_dir / f"{job_id}.mp4")
+            async with session.get(dl_url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    continue
+                with open(final_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        f.write(chunk)
+
+            fsize = os.path.getsize(final_path)
+            if fsize < 1000:
+                os.remove(final_path)
+                continue
+
+            if fsize > TELEGRAM_MAX_SIZE:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None, 0, 0, 0, f"File too large ({fsize // 1048576} MB > 50 MB)"
+
+            dur, w, h = await ffprobe_meta(final_path)
+            title = data.get("filename", "Video").rsplit(".", 1)[0][:100]
+            logger.info("Cobalt download OK: %s", title)
+            return final_path, title, dur, w, h, None
+
+        except Exception as e:
+            logger.error("Cobalt error (%s): %s", instance, e)
+            continue
+
+    return None
+
+
+# ──────────────────────────────────────────────
 #  RECLIP download logic  (app.py lines 16-73)
 #  Exact same command, made async
 # ──────────────────────────────────────────────
@@ -254,10 +322,15 @@ async def reclip_download(url):
     if cookie_path:
         cmd += ["--cookies", cookie_path]
 
-    # proxy (rotates through pool for YouTube etc)
-    proxy = get_proxy()
-    if proxy:
-        cmd += ["--proxy", proxy]
+    # proxy only for platforms that need it (NOT instagram — proxy IP breaks cookies)
+    if platform not in ("instagram",):
+        proxy = get_proxy()
+        if proxy:
+            cmd += ["--proxy", proxy]
+
+    # youtube: bypass bot detection with mobile web client
+    if platform == "youtube":
+        cmd += ["--extractor-args", "youtube:player_client=mweb"]
 
     # twitter needs syndication API on servers (guest token is broken)
     if platform == "twitter":
@@ -277,6 +350,14 @@ async def reclip_download(url):
         if proc.returncode != 0:
             err = stderr.decode().strip().split("\n")[-1] if stderr else "unknown"
             logger.error("yt-dlp error: %s", err)
+
+            # YouTube fallback: try cobalt API
+            if platform == "youtube":
+                logger.info("Trying cobalt fallback for YouTube: %s", url)
+                cobalt_result = await cobalt_download(url, out_dir, job_id)
+                if cobalt_result:
+                    return cobalt_result
+
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None, 0, 0, 0, err
 
