@@ -114,7 +114,14 @@ def setup_cookies():
             p = COOKIES_DIR / f"{platform}.txt"
             p.write_bytes(raw)
             PLATFORM_COOKIES[platform] = str(p)
-            logger.info("Cookies written for %s", platform)
+            # verify cookie file
+            content = raw.decode("utf-8", errors="replace")
+            lines = [l for l in content.strip().splitlines() if l.strip() and not l.startswith("#")]
+            has_sessionid = "sessionid" in content
+            logger.info(
+                "Cookies for %s: %d bytes, %d data lines, sessionid=%s, path=%s",
+                platform, len(raw), len(lines), has_sessionid, p,
+            )
         except Exception as e:
             logger.error("Failed to decode %s cookies: %s", platform, e)
 
@@ -315,7 +322,12 @@ async def reclip_download(url):
 
     # ── reclip command ──
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-    cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+
+    # format: reclip default, but flexible fallback for server clients
+    if platform == "youtube":
+        cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
+    else:
+        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
     # per-platform cookies
     cookie_path = PLATFORM_COOKIES.get(platform)
@@ -328,9 +340,9 @@ async def reclip_download(url):
         if proxy:
             cmd += ["--proxy", proxy]
 
-    # youtube: bypass bot detection with mobile web client
+    # youtube: try multiple player clients to bypass bot detection
     if platform == "youtube":
-        cmd += ["--extractor-args", "youtube:player_client=mweb"]
+        cmd += ["--extractor-args", "youtube:player_client=mweb,default"]
 
     # twitter needs syndication API on servers (guest token is broken)
     if platform == "twitter":
