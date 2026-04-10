@@ -353,6 +353,21 @@ async def _tiktok_fast(url):
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None
 
+        # check codec — tikwm hdplay can return HEVC which Telegram shows as black screen
+        codec = await _get_video_codec(path)
+        if codec and codec not in ("h264", "avc1", "avc"):
+            log.info("[tiktok/tikwm] codec %s, re-encoding to h264", codec)
+            reencoded = str(out_dir / "reencoded.mp4")
+            ok = await _reencode_h264(path, reencoded)
+            if ok:
+                os.remove(path)
+                path = reencoded
+                size = os.path.getsize(path)
+            else:
+                # bad codec, can't reencode — fall back to yt-dlp
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None
+
         dur, w, h = await _ffprobe(path)
         log.info("[tiktok/tikwm] OK: %s (%d bytes)", title, size)
         return {"type": "video", "path": path, "title": title,
@@ -362,6 +377,42 @@ async def _tiktok_fast(url):
     except Exception as e:
         log.warning("[tiktok/tikwm] %s", e)
         return None, None
+
+
+async def _get_video_codec(path):
+    """Get video codec name via ffprobe."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "json", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        data = json.loads(out)
+        for s in data.get("streams", []):
+            return s.get("codec_name", "").lower()
+    except Exception:
+        pass
+    return None
+
+
+async def _reencode_h264(input_path, output_path):
+    """Re-encode video to H.264 for Telegram compatibility."""
+    try:
+        cmd = ["ffmpeg", "-y", "-i", input_path,
+               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+               "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+               output_path]
+        p = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await asyncio.wait_for(p.communicate(), 120)
+        if p.returncode != 0:
+            log.error("[reencode] ffmpeg error: %s", stderr.decode()[:300] if stderr else "")
+            return False
+        return Path(output_path).exists() and Path(output_path).stat().st_size > 0
+    except Exception as e:
+        log.error("[reencode] %s", e)
+        return False
 
 
 async def _ffprobe(path):
