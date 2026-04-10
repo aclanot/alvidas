@@ -547,9 +547,15 @@ async def _ytdlp_download(url, platform):
     if platform == "tiktok":
         opts["format"] = "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc1]/best[vcodec^=avc1]/best"
 
-    # youtube: flexible format
+    # youtube: prefer H.264 (avc1) — VP9/AV1 cause black screen in Telegram
     if platform == "youtube":
-        opts["format"] = "bv*+ba/b"
+        opts["format"] = (
+            "bestvideo[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/"
+            "bestvideo[vcodec^=avc1][height<=720]+bestaudio/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo[height<=720]+bestaudio/"
+            "bestvideo+bestaudio/best"
+        )
 
     loop = asyncio.get_event_loop()
 
@@ -583,12 +589,12 @@ async def _ytdlp_download(url, platform):
         if downloads:
             filepath = downloads[0].get("filepath")
             if filepath and Path(filepath).exists():
-                # re-encode if TikTok still has bad codec (hevc, bvc2, 10-bit)
-                if platform == "tiktok":
+                # re-encode if codec is unsafe for Telegram (hevc, bvc2, av1, vp9, etc.)
+                SAFE_CODECS = {"h264", "avc1", "avc"}
+                if platform in ("tiktok", "youtube"):
                     codec = await _get_video_codec(filepath)
-                    SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
                     if codec and codec not in SAFE_CODECS:
-                        log.info("[tiktok/ytdlp] codec %s - re-encoding to h264", codec)
+                        log.info("[%s/ytdlp] codec %s - re-encoding to h264", platform, codec)
                         reencoded = str(out_dir / "reencoded.mp4")
                         ok = await _reencode_h264(filepath, reencoded)
                         if ok:
@@ -615,11 +621,11 @@ async def _ytdlp_download(url, platform):
         # fallback: find any video file
         if videos:
             v = videos[0]
-            if platform == "tiktok":
+            SAFE_CODECS = {"h264", "avc1", "avc"}
+            if platform in ("tiktok", "youtube"):
                 codec = await _get_video_codec(str(v))
-                SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
                 if codec and codec not in SAFE_CODECS:
-                    log.info("[tiktok/ytdlp-fallback] codec %s - re-encoding to h264", codec)
+                    log.info("[%s/ytdlp-fallback] codec %s - re-encoding to h264", platform, codec)
                     reencoded = str(out_dir / "reencoded.mp4")
                     ok = await _reencode_h264(str(v), reencoded)
                     if ok:
