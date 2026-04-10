@@ -343,50 +343,93 @@ def _ytdlp_extract(url, opts):
 
 # ── cobalt fallback for YouTube ──
 
-COBALT_INSTANCES = [
-    "https://cobalt.canine.tools",
-    "https://cobalt.aether.icu",
-    "https://api.cobalt.tools",
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.in.projectsegfau.lt",
 ]
 
 
-async def cobalt_download(url):
-    """Fallback for YouTube when yt-dlp fails. Tries multiple cobalt instances."""
+def _extract_video_id(url):
+    """Extract YouTube video ID from URL."""
+    m = re.search(r"(?:v=|shorts/|youtu\.be/)([\w-]{11})", url)
+    return m.group(1) if m else None
+
+
+async def piped_download(url):
+    """Fallback for YouTube: use Piped API to get direct stream URLs."""
+    vid = _extract_video_id(url)
+    if not vid:
+        return None, "Could not extract video ID"
+
     job = os.urandom(5).hex()
     out_dir = DL_DIR / job
     out_dir.mkdir(exist_ok=True)
     path = str(out_dir / f"{job}.mp4")
 
     s = await get_session()
-    api_key = os.environ.get("COBALT_API_KEY", "")
 
     try:
-        dl_url = None
-        for instance in COBALT_INSTANCES:
+        stream_data = None
+        for instance in PIPED_INSTANCES:
             try:
-                headers = {"Accept": "application/json", "Content-Type": "application/json"}
-                if instance == "https://api.cobalt.tools" and api_key:
-                    headers["Authorization"] = f"Api-Key {api_key}"
-                async with s.post(f"{instance}/", json={"url": url, "videoQuality": "720"},
-                                  headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    data = await r.json()
-                dl_url = data.get("url")
-                if dl_url:
-                    log.info("[cobalt] using %s", instance)
-                    break
-                log.warning("[cobalt] %s: %s", instance, data)
+                async with s.get(f"{instance}/streams/{vid}",
+                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        continue
+                    stream_data = await r.json()
+                    if stream_data.get("videoStreams"):
+                        log.info("[piped] using %s", instance)
+                        break
+                    stream_data = None
             except Exception as e:
-                log.warning("[cobalt] %s failed: %s", instance, e)
+                log.warning("[piped] %s failed: %s", instance, e)
                 continue
 
-        if not dl_url:
+        if not stream_data:
             shutil.rmtree(out_dir, ignore_errors=True)
-            return None, "All cobalt instances failed"
+            return None, "All Piped instances failed"
 
-        async with s.get(dl_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+        title = stream_data.get("title", "Video")[:100]
+        duration = stream_data.get("duration", 0)
+
+        # find best video stream under 50MB (prefer mp4/720p)
+        best_url = None
+        best_w = 0
+        best_h = 0
+        for vs in stream_data.get("videoStreams", []):
+            if not vs.get("videoOnly", True) and vs.get("url"):
+                h = vs.get("height", 0)
+                if h <= 720 and h > best_h:
+                    best_url = vs["url"]
+                    best_w = vs.get("width", 0)
+                    best_h = h
+
+        # if no combined streams, try videoOnly + audio
+        if not best_url:
+            for vs in stream_data.get("videoStreams", []):
+                if vs.get("url"):
+                    h = vs.get("height", 0)
+                    if h <= 720 and h > best_h:
+                        best_url = vs["url"]
+                        best_w = vs.get("width", 0)
+                        best_h = h
+
+        if not best_url:
+            # last resort: HLS
+            hls = stream_data.get("hls")
+            if hls:
+                best_url = hls
+
+        if not best_url:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "No suitable stream found"
+
+        # download
+        async with s.get(best_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
             if r.status != 200:
                 shutil.rmtree(out_dir, ignore_errors=True)
-                return None, f"Cobalt HTTP {r.status}"
+                return None, f"Piped stream HTTP {r.status}"
             with open(path, "wb") as f:
                 async for chunk in r.content.iter_chunked(65536):
                     f.write(chunk)
@@ -394,21 +437,24 @@ async def cobalt_download(url):
         size = os.path.getsize(path)
         if size < 1000:
             shutil.rmtree(out_dir, ignore_errors=True)
-            return None, "Cobalt empty file"
+            return None, "Piped empty file"
 
-        log.info("[cobalt] OK %d bytes", size)
-        title = data.get("filename", "Video").rsplit(".", 1)[0][:100]
+        if size > MAX_TG:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, f"Too large ({size // 1048576} MB, limit 50 MB)"
+
+        log.info("[piped] OK: %s (%d bytes)", title, size)
         return {
             "type": "video",
             "path": path,
             "title": title,
-            "duration": 0, "width": 0, "height": 0,
+            "duration": duration, "width": best_w, "height": best_h,
             "size": size,
             "dir": str(out_dir),
         }, None
 
     except Exception as e:
-        log.error("[cobalt] %s", e)
+        log.error("[piped] %s", e)
         shutil.rmtree(out_dir, ignore_errors=True)
         return None, str(e)
 
@@ -450,10 +496,10 @@ async def handle(update):
             # download
             result, err = await download_media(url, platform)
 
-            # YouTube fallback to cobalt
+            # YouTube fallback to Piped API
             if err and platform == "youtube":
-                log.info("[youtube] trying cobalt fallback")
-                result, err = await cobalt_download(url)
+                log.info("[youtube] trying Piped fallback")
+                result, err = await piped_download(url)
 
             if err:
                 if sid:
