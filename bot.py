@@ -333,43 +333,83 @@ async def _tiktok_fast(url):
                 return {"type": "photos", "title": title,
                         "photo_paths": photo_paths, "dir": str(out_dir)}, None
 
-        # video
-        video_url = vdata.get("hdplay") or vdata.get("play") or vdata.get("wmplay")
-        if not video_url:
+        # video — try URLs in order of preference, skip any that return bvc2/unsafe codec
+        # play2 = h264 no-watermark (newer tikwm field), play = standard, hdplay = HD (often bvc2/hevc)
+        SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
+        candidate_urls = [u for u in [
+            vdata.get("play2"),      # h264 no-watermark (preferred)
+            vdata.get("play"),       # standard h264
+            vdata.get("wmplay"),     # watermarked h264 fallback
+            vdata.get("hdplay"),     # HD — often bvc2/hevc, try last
+        ] if u]
+
+        if not candidate_urls:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None
 
-        path = str(out_dir / f"{job}.mp4")
-        async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
-            if vr.status != 200:
+        path = None
+        for video_url in candidate_urls:
+            candidate_path = str(out_dir / f"{job}_candidate.mp4")
+            try:
+                async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                    if vr.status != 200:
+                        continue
+                    with open(candidate_path, "wb") as f:
+                        async for chunk in vr.content.iter_chunked(65536):
+                            f.write(chunk)
+            except Exception as e:
+                log.warning("[tiktok/tikwm] URL fetch failed: %s", e)
+                continue
+
+            if os.path.getsize(candidate_path) < 1000:
+                os.remove(candidate_path)
+                continue
+
+            codec = await _get_video_codec(candidate_path)
+            if codec and codec not in SAFE_CODECS:
+                log.info("[tiktok/tikwm] skipping URL with codec %s, trying next", codec)
+                os.remove(candidate_path)
+                continue
+
+            # safe codec (or unknown — keep and let Telegram decide)
+            final_path = str(out_dir / f"{job}.mp4")
+            os.rename(candidate_path, final_path)
+            path = final_path
+            log.info("[tiktok/tikwm] accepted URL with codec=%s", codec)
+            break
+
+        if not path:
+            # last resort: take hdplay and re-encode
+            video_url = vdata.get("hdplay") or vdata.get("play")
+            if not video_url:
                 shutil.rmtree(out_dir, ignore_errors=True)
                 return None, None
-            with open(path, "wb") as f:
-                async for chunk in vr.content.iter_chunked(65536):
-                    f.write(chunk)
+            fallback_path = str(out_dir / f"{job}_raw.mp4")
+            try:
+                async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                    if vr.status != 200:
+                        shutil.rmtree(out_dir, ignore_errors=True)
+                        return None, None
+                    with open(fallback_path, "wb") as f:
+                        async for chunk in vr.content.iter_chunked(65536):
+                            f.write(chunk)
+            except Exception as e:
+                log.error("[tiktok/tikwm] fallback fetch failed: %s", e)
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None
+            log.info("[tiktok/tikwm] no safe URL found, re-encoding fallback")
+            reencoded = str(out_dir / f"{job}.mp4")
+            ok = await _reencode_h264(fallback_path, reencoded)
+            try:
+                os.remove(fallback_path)
+            except Exception:
+                pass
+            if not ok:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, None
+            path = reencoded
 
         size = os.path.getsize(path)
-        if size < 1000:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
-
-        # check codec - tikwm can return HEVC, bvc2, or 10-bit which Telegram shows as black
-        codec = await _get_video_codec(path)
-        SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
-        if codec and codec not in SAFE_CODECS:
-            log.info("[tiktok/tikwm] codec %s - re-encoding to h264/yuv420p", codec)
-            reencoded = str(out_dir / "reencoded.mp4")
-            ok = await _reencode_h264(path, reencoded)
-            if ok:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-                path = reencoded
-                size = os.path.getsize(path)
-            else:
-                shutil.rmtree(out_dir, ignore_errors=True)
-                return None, None
 
         dur, w, h = await _ffprobe(path)
         log.info("[tiktok/tikwm] OK: %s (%d bytes)", title, size)
