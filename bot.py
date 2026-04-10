@@ -345,8 +345,13 @@ def _ytdlp_extract(url, opts):
 
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
+    "https://pipedapi-libre.kavin.rocks",
     "https://pipedapi.adminforge.de",
-    "https://pipedapi.in.projectsegfau.lt",
+    "https://api.piped.yt",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.ducks.party",
+    "https://pipedapi.reallyaweso.me",
 ]
 
 
