@@ -355,11 +355,6 @@ async def _tiktok_fast(url):
 
         # check codec — tikwm hdplay can return HEVC/bvc2 which Telegram can't play
         codec = await _get_video_codec(path)
-        if codec and codec in ("bvc2", "bvc1", "bytevc1", "bytevc2"):
-            # proprietary codec, can't decode at all — skip to yt-dlp
-            log.info("[tiktok/tikwm] got %s codec, skipping to yt-dlp", codec)
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
         if codec and codec not in ("h264", "avc1", "avc", "vp9", "vp8"):
             log.info("[tiktok/tikwm] codec %s, re-encoding to h264", codec)
             reencoded = str(out_dir / "reencoded.mp4")
@@ -544,6 +539,22 @@ async def _ytdlp_download(url, platform):
         if downloads:
             filepath = downloads[0].get("filepath")
             if filepath and Path(filepath).exists():
+                # re-encode if TikTok snuck through a bvc2/non-H.264 file
+                if platform == "tiktok":
+                    codec = await _get_video_codec(filepath)
+                    if codec and codec not in ("h264", "avc1", "avc", "vp9", "vp8"):
+                        log.info("[tiktok/ytdlp] codec %s, re-encoding to h264", codec)
+                        reencoded = str(out_dir / "reencoded.mp4")
+                        ok = await _reencode_h264(filepath, reencoded)
+                        if ok:
+                            try:
+                                os.remove(filepath)
+                            except Exception:
+                                pass
+                            filepath = reencoded
+                        else:
+                            shutil.rmtree(out_dir, ignore_errors=True)
+                            return None, "Re-encode failed"
                 size = Path(filepath).stat().st_size
                 return {
                     "type": "video",
@@ -559,6 +570,22 @@ async def _ytdlp_download(url, platform):
         # fallback: find any video file
         if videos:
             v = videos[0]
+            # re-encode if TikTok snuck through a bvc2/non-H.264 file
+            if platform == "tiktok":
+                codec = await _get_video_codec(str(v))
+                if codec and codec not in ("h264", "avc1", "avc", "vp9", "vp8"):
+                    log.info("[tiktok/ytdlp-fallback] codec %s, re-encoding to h264", codec)
+                    reencoded = str(out_dir / "reencoded.mp4")
+                    ok = await _reencode_h264(str(v), reencoded)
+                    if ok:
+                        try:
+                            os.remove(str(v))
+                        except Exception:
+                            pass
+                        v = Path(reencoded)
+                    else:
+                        shutil.rmtree(out_dir, ignore_errors=True)
+                        return None, "Re-encode failed"
             return {
                 "type": "video",
                 "path": str(v),
