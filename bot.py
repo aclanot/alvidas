@@ -43,7 +43,15 @@ for entry in PROXY_LIST_RAW.split(","):
 if INSTAGRAM_COOKIES_B64:
     try:
         raw = base64.b64decode(INSTAGRAM_COOKIES_B64)
-        text = raw.decode("utf-8-sig").replace("\r\n", "\n")
+        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("latin-1")
+        text = text.replace("\r\n", "\n")
         if not text.startswith("# Netscape"):
             text = "# Netscape HTTP Cookie File\n\n" + text
         COOKIE_FILE.write_text(text, encoding="utf-8")
