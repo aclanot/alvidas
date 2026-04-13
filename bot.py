@@ -19,16 +19,13 @@ log = logging.getLogger("bot")
 # ── config ──
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
 PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
-
 MAX_TG = 50 * 1024 * 1024
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
 COOKIE_DIR = DL_DIR / "cookies"
 COOKIE_DIR.mkdir(exist_ok=True)
-
 COOKIES = {}
 
 # ── proxies ──
@@ -48,9 +45,9 @@ if PROXIES:
 # ── cookies from base64 env vars ──
 COOKIE_ENV = {
     "instagram": INSTAGRAM_COOKIES_B64,
-    "youtube": os.environ.get("YOUTUBE_COOKIES_BASE64", ""),
-    "twitter": os.environ.get("TWITTER_COOKIES_BASE64", ""),
-    "tiktok": os.environ.get("TIKTOK_COOKIES_BASE64", ""),
+    "youtube":   os.environ.get("YOUTUBE_COOKIES_BASE64", ""),
+    "twitter":   os.environ.get("TWITTER_COOKIES_BASE64", ""),
+    "tiktok":    os.environ.get("TIKTOK_COOKIES_BASE64", ""),
 }
 for platform, b64 in COOKIE_ENV.items():
     if not b64:
@@ -66,13 +63,12 @@ for platform, b64 in COOKIE_ENV.items():
         else:
             text = raw.decode("latin-1")
         text = text.replace("\r\n", "\n")
-        # fix cookies exported with spaces instead of tabs
         fixed_lines = []
         for line in text.split("\n"):
             if line.startswith("#") or not line.strip():
                 fixed_lines.append(line)
-            elif "\t" not in line and "  " in line:
-                fixed_lines.append(re.sub(r"  +", "\t", line))
+            elif "\t" not in line and " " in line:
+                fixed_lines.append(re.sub(r" +", "\t", line))
             else:
                 fixed_lines.append(line)
         text = "\n".join(fixed_lines)
@@ -89,16 +85,16 @@ for platform, b64 in COOKIE_ENV.items():
 
 # ── URL patterns ──
 PATTERNS = {
-    "tiktok": [r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+"],
+    "tiktok":    [r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+"],
     "instagram": [r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv|stories)/[\w.-]+(?:/[\w.-]+)?"],
-    "twitter": [r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+"],
-    "youtube": [
+    "twitter":   [r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+"],
+    "youtube":   [
         r"https?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)[\w-]+",
         r"https?://youtu\.be/[\w-]+",
         r"https?://music\.youtube\.com/watch\?v=[\w-]+",
     ],
 }
-EMOJI = {"tiktok": "\U0001f3b5", "instagram": "\U0001f4f7", "twitter": "\U0001d54f", "youtube": "\u25b6\ufe0f"}
+EMOJI = {"tiktok": "🎵", "instagram": "📷", "twitter": "𝕏", "youtube": "▶️"}
 
 session: aiohttp.ClientSession = None
 busy = set()
@@ -177,10 +173,21 @@ async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
     return await tg("sendVideo", d, 180)
 
 
+# FIX: use real file extension and correct content-type instead of always audio/mpeg
 async def send_audio(chat, path, caption, reply):
+    ext = Path(path).suffix.lower() or ".ogg"
+    _CT = {
+        ".mp3":  "audio/mpeg",
+        ".m4a":  "audio/mp4",
+        ".ogg":  "audio/ogg",
+        ".opus": "audio/ogg",
+        ".webm": "audio/webm",
+    }
+    ct = _CT.get(ext, "audio/octet-stream")
+    filename = f"audio{ext}"
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
-    d.add_field("audio", open(path, "rb"), filename="audio.mp3", content_type="audio/mpeg")
+    d.add_field("audio", open(path, "rb"), filename=filename, content_type=ct)
     d.add_field("caption", caption[:1024])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
@@ -215,7 +222,7 @@ async def send_media_group(chat, paths, caption, reply):
     return await tg("sendMediaGroup", d, 120)
 
 
-# ── fast paths: direct API downloads (from botik_dodik) ──
+# ── fast paths: direct API downloads ──
 
 async def _twitter_fast(url):
     """Download Twitter/X via fxtwitter API — instant, no yt-dlp."""
@@ -231,63 +238,62 @@ async def _twitter_fast(url):
             if r.status != 200:
                 return None, None
             data = await r.json()
-
-        tweet = data.get("tweet", {})
-        if not tweet:
-            return None, None
-        title = (tweet.get("text") or "Tweet")[:100]
-        media = tweet.get("media", {})
-        videos = media.get("videos") or []
-        photos = media.get("photos") or []
-
-        job = os.urandom(5).hex()
-        out_dir = DL_DIR / job
-        out_dir.mkdir(exist_ok=True)
-
-        if videos:
-            video_url = videos[0].get("url", "")
-            if not video_url:
+            tweet = data.get("tweet", {})
+            if not tweet:
                 return None, None
-            path = str(out_dir / f"{job}.mp4")
-            async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
-                if vr.status != 200:
+            title = (tweet.get("text") or "Tweet")[:100]
+            media = tweet.get("media", {})
+            videos = media.get("videos") or []
+            photos = media.get("photos") or []
+
+            job = os.urandom(5).hex()
+            out_dir = DL_DIR / job
+            out_dir.mkdir(exist_ok=True)
+
+            if videos:
+                video_url = videos[0].get("url", "")
+                if not video_url:
                     return None, None
-                with open(path, "wb") as f:
-                    async for chunk in vr.content.iter_chunked(65536):
-                        f.write(chunk)
-            size = os.path.getsize(path)
-            if size < 1000:
-                shutil.rmtree(out_dir, ignore_errors=True)
-                return None, None
-            dur, w, h = await _ffprobe(path)
-            log.info("[twitter/fxtwitter] OK: %s (%d bytes)", title, size)
-            return {"type": "video", "path": path, "title": title,
-                    "duration": dur, "width": w, "height": h,
-                    "size": size, "dir": str(out_dir)}, None
+                path = str(out_dir / f"{job}.mp4")
+                async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                    if vr.status != 200:
+                        return None, None
+                    with open(path, "wb") as f:
+                        async for chunk in vr.content.iter_chunked(65536):
+                            f.write(chunk)
+                size = os.path.getsize(path)
+                if size < 1000:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, None
+                dur, w, h = await _ffprobe(path)
+                log.info("[twitter/fxtwitter] OK: %s (%d bytes)", title, size)
+                return {"type": "video", "path": path, "title": title,
+                        "duration": dur, "width": w, "height": h,
+                        "size": size, "dir": str(out_dir)}, None
 
-        if photos:
-            photo_paths = []
-            for i, p in enumerate(photos[:10]):
-                img_url = p.get("url", "")
-                if not img_url:
-                    continue
-                try:
-                    async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as pr:
-                        if pr.status != 200:
-                            continue
-                        content = await pr.read()
-                        pp = out_dir / f"photo_{i}.jpg"
-                        pp.write_bytes(content)
-                        photo_paths.append(str(pp))
-                except Exception:
-                    continue
-            if photo_paths:
-                log.info("[twitter/fxtwitter] %d photos", len(photo_paths))
-                return {"type": "photos", "title": title,
-                        "photo_paths": photo_paths, "dir": str(out_dir)}, None
+            if photos:
+                photo_paths = []
+                for i, p in enumerate(photos[:10]):
+                    img_url = p.get("url", "")
+                    if not img_url:
+                        continue
+                    try:
+                        async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as pr:
+                            if pr.status != 200:
+                                continue
+                            content = await pr.read()
+                            pp = out_dir / f"photo_{i}.jpg"
+                            pp.write_bytes(content)
+                            photo_paths.append(str(pp))
+                    except Exception:
+                        continue
+                if photo_paths:
+                    log.info("[twitter/fxtwitter] %d photos", len(photo_paths))
+                    return {"type": "photos", "title": title,
+                            "photo_paths": photo_paths, "dir": str(out_dir)}, None
 
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return None, None
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
     except Exception as e:
         log.warning("[twitter/fxtwitter] %s", e)
         return None, None
@@ -303,119 +309,114 @@ async def _tiktok_fast(url):
             if r.status != 200:
                 return None, None
             data = await r.json()
+            if data.get("code") != 0:
+                return None, None
+            vdata = data.get("data", {})
+            title = (vdata.get("title") or "TikTok")[:100]
 
-        if data.get("code") != 0:
-            return None, None
+            job = os.urandom(5).hex()
+            out_dir = DL_DIR / job
+            out_dir.mkdir(exist_ok=True)
 
-        vdata = data.get("data", {})
-        title = (vdata.get("title") or "TikTok")[:100]
-
-        job = os.urandom(5).hex()
-        out_dir = DL_DIR / job
-        out_dir.mkdir(exist_ok=True)
-
-        # photo slideshow
-        images = vdata.get("images")
-        if images:
-            photo_paths = []
-            for i, img_url in enumerate(images[:10]):
-                try:
-                    async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as ir:
-                        if ir.status != 200:
-                            continue
-                        pp = out_dir / f"photo_{i}.jpg"
-                        pp.write_bytes(await ir.read())
-                        photo_paths.append(str(pp))
-                except Exception:
-                    continue
-            if photo_paths:
-                log.info("[tiktok/tikwm] %d photos", len(photo_paths))
-                return {"type": "photos", "title": title,
-                        "photo_paths": photo_paths, "dir": str(out_dir)}, None
-
-        # video — try URLs in order of preference, skip any that return bvc2/unsafe codec
-        # play2 = h264 no-watermark (newer tikwm field), play = standard, hdplay = HD (often bvc2/hevc)
-        SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
-        candidate_urls = [u for u in [
-            vdata.get("play2"),      # h264 no-watermark (preferred)
-            vdata.get("play"),       # standard h264
-            vdata.get("wmplay"),     # watermarked h264 fallback
-            vdata.get("hdplay"),     # HD — often bvc2/hevc, try last
-        ] if u]
-
-        if not candidate_urls:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
-
-        path = None
-        for video_url in candidate_urls:
-            candidate_path = str(out_dir / f"{job}_candidate.mp4")
-            try:
-                async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
-                    if vr.status != 200:
+            # photo slideshow
+            images = vdata.get("images")
+            if images:
+                photo_paths = []
+                for i, img_url in enumerate(images[:10]):
+                    try:
+                        async with s.get(img_url, timeout=aiohttp.ClientTimeout(total=15)) as ir:
+                            if ir.status != 200:
+                                continue
+                            pp = out_dir / f"photo_{i}.jpg"
+                            pp.write_bytes(await ir.read())
+                            photo_paths.append(str(pp))
+                    except Exception:
                         continue
-                    with open(candidate_path, "wb") as f:
-                        async for chunk in vr.content.iter_chunked(65536):
-                            f.write(chunk)
-            except Exception as e:
-                log.warning("[tiktok/tikwm] URL fetch failed: %s", e)
-                continue
+                if photo_paths:
+                    log.info("[tiktok/tikwm] %d photos", len(photo_paths))
+                    return {"type": "photos", "title": title,
+                            "photo_paths": photo_paths, "dir": str(out_dir)}, None
 
-            if os.path.getsize(candidate_path) < 1000:
-                os.remove(candidate_path)
-                continue
+            # video — prefer safe codecs
+            SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
+            candidate_urls = [u for u in [
+                vdata.get("play2"),
+                vdata.get("play"),
+                vdata.get("wmplay"),
+                vdata.get("hdplay"),
+            ] if u]
 
-            codec = await _get_video_codec(candidate_path)
-            if codec and codec not in SAFE_CODECS:
-                log.info("[tiktok/tikwm] skipping URL with codec %s, trying next", codec)
-                os.remove(candidate_path)
-                continue
-
-            # safe codec (or unknown — keep and let Telegram decide)
-            final_path = str(out_dir / f"{job}.mp4")
-            os.rename(candidate_path, final_path)
-            path = final_path
-            log.info("[tiktok/tikwm] accepted URL with codec=%s", codec)
-            break
-
-        if not path:
-            # last resort: take hdplay and re-encode
-            video_url = vdata.get("hdplay") or vdata.get("play")
-            if not video_url:
+            if not candidate_urls:
                 shutil.rmtree(out_dir, ignore_errors=True)
                 return None, None
-            fallback_path = str(out_dir / f"{job}_raw.mp4")
-            try:
-                async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
-                    if vr.status != 200:
-                        shutil.rmtree(out_dir, ignore_errors=True)
-                        return None, None
-                    with open(fallback_path, "wb") as f:
-                        async for chunk in vr.content.iter_chunked(65536):
-                            f.write(chunk)
-            except Exception as e:
-                log.error("[tiktok/tikwm] fallback fetch failed: %s", e)
-                shutil.rmtree(out_dir, ignore_errors=True)
-                return None, None
-            log.info("[tiktok/tikwm] no safe URL found, re-encoding fallback")
-            reencoded = str(out_dir / f"{job}.mp4")
-            ok = await _reencode_h264(fallback_path, reencoded)
-            try:
-                os.remove(fallback_path)
-            except Exception:
-                pass
-            if not ok:
-                shutil.rmtree(out_dir, ignore_errors=True)
-                return None, None
-            path = reencoded
 
-        size = os.path.getsize(path)
+            path = None
+            for video_url in candidate_urls:
+                candidate_path = str(out_dir / f"{job}_candidate.mp4")
+                try:
+                    async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                        if vr.status != 200:
+                            continue
+                        with open(candidate_path, "wb") as f:
+                            async for chunk in vr.content.iter_chunked(65536):
+                                f.write(chunk)
+                except Exception as e:
+                    log.warning("[tiktok/tikwm] URL fetch failed: %s", e)
+                    continue
 
-        dur, w, h = await _ffprobe(path)
-        log.info("[tiktok/tikwm] OK: %s (%d bytes)", title, size)
-        return {"type": "video", "path": path, "title": title,
-                "duration": dur, "width": w, "height": h,
-                "size": size, "dir": str(out_dir)}, None
+                if os.path.getsize(candidate_path) < 1000:
+                    os.remove(candidate_path)
+                    continue
+
+                codec = await _get_video_codec(candidate_path)
+                if codec and codec not in SAFE_CODECS:
+                    log.info("[tiktok/tikwm] skipping URL with codec %s, trying next", codec)
+                    os.remove(candidate_path)
+                    continue
+
+                final_path = str(out_dir / f"{job}.mp4")
+                os.rename(candidate_path, final_path)
+                path = final_path
+                log.info("[tiktok/tikwm] accepted URL with codec=%s", codec)
+                break
+
+            if not path:
+                video_url = vdata.get("hdplay") or vdata.get("play")
+                if not video_url:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, None
+                fallback_path = str(out_dir / f"{job}_raw.mp4")
+                try:
+                    async with s.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as vr:
+                        if vr.status != 200:
+                            shutil.rmtree(out_dir, ignore_errors=True)
+                            return None, None
+                        with open(fallback_path, "wb") as f:
+                            async for chunk in vr.content.iter_chunked(65536):
+                                f.write(chunk)
+                except Exception as e:
+                    log.error("[tiktok/tikwm] fallback fetch failed: %s", e)
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, None
+
+                log.info("[tiktok/tikwm] no safe URL found, re-encoding fallback")
+                reencoded = str(out_dir / f"{job}.mp4")
+                ok = await _reencode_h264(fallback_path, reencoded)
+                try:
+                    os.remove(fallback_path)
+                except Exception:
+                    pass
+                if not ok:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, None
+                path = reencoded
+
+            size = os.path.getsize(path)
+            dur, w, h = await _ffprobe(path)
+            log.info("[tiktok/tikwm] OK: %s (%d bytes)", title, size)
+            return {"type": "video", "path": path, "title": title,
+                    "duration": dur, "width": w, "height": h,
+                    "size": size, "dir": str(out_dir)}, None
 
     except Exception as e:
         log.warning("[tiktok/tikwm] %s", e)
@@ -477,95 +478,93 @@ async def _ffprobe(path):
         return 0, 0, 0
 
 
-# ── download with yt-dlp as Python library (from yt-dlp-telegram) ──
+# FIX: helper to confirm a file actually contains a video stream
+async def has_video_stream(path):
+    """Return True if the file contains at least one video stream."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type", "-of", "json", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        data = json.loads(out)
+        return len(data.get("streams", [])) > 0
+    except Exception:
+        return True  # assume video on error, preserve old behaviour
+
+
+# ── download with yt-dlp as Python library ──
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 async def download_media(url, platform):
-    """
-    Fast path first (direct API), then yt-dlp fallback.
-    """
-    # Twitter: try fxtwitter API first (instant)
     if platform == "twitter":
         result, err = await _twitter_fast(url)
         if result:
             return result, None
 
-    # TikTok: try tikwm API first (faster)
     if platform == "tiktok":
         result, err = await _tiktok_fast(url)
         if result:
             return result, None
 
-    # Fallback: yt-dlp for everything
     return await _ytdlp_download(url, platform)
 
 
 async def _ytdlp_download(url, platform):
-    """
-    Download using yt-dlp Python library.
-    Combines yt-dlp-telegram (library usage, js_runtime) with botik_dodik (async, platform handling).
-    Returns: (result_dict, error_string)
-    result_dict: {type: video|photos, path, title, duration, width, height, size, photo_paths}
-    """
     job = os.urandom(5).hex()
     out_dir = DL_DIR / job
     out_dir.mkdir(exist_ok=True)
     tmpl = str(out_dir / f"{job}.%(ext)s")
 
     opts = {
-        "outtmpl": tmpl,
-        "noplaylist": True,
-        "no_warnings": True,
-        "format": "bestvideo+bestaudio/best",
+        "outtmpl":            tmpl,
+        "noplaylist":         True,
+        "no_warnings":        True,
+        "format":             "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "max_filesize": MAX_TG,
-        "socket_timeout": 30,
-        "quiet": True,
+        "max_filesize":       MAX_TG,
+        "socket_timeout":     30,
+        "quiet":              True,
     }
 
-    # bun JS runtime for YouTube challenges (from yt-dlp-telegram)
     if shutil.which("bun"):
-        opts["js_runtimes"] = {"bun": {"path": "bun"}}
+        opts["js_runtimes"]      = {"bun": {"path": "bun"}}
         opts["remote_components"] = {"ejs:github"}
 
-    # platform-specific cookies
     cookie = COOKIES.get(platform)
     if cookie:
         opts["cookiefile"] = cookie
 
-    # proxy (not for instagram — breaks cookie session, not for youtube — try direct first)
     if platform not in ("instagram", "youtube") and PROXIES:
         opts["proxy"] = random.choice(PROXIES)
 
-    # twitter syndication
     if platform == "twitter":
         opts["extractor_args"] = {"twitter": ["api=syndication"]}
 
-    # tiktok: only H.264, reject bvc2
     if platform == "tiktok":
         opts["format"] = "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc1]/best[vcodec^=avc1]/best"
 
-    # youtube: flexible format
+    # FIX: prefer combined progressive streams first to avoid audio-only DASH results
     if platform == "youtube":
-        opts["format"] = "bv*+ba/b"
+        opts["format"] = (
+            "best[ext=mp4][vcodec!=none][acodec!=none][height<=720]/"
+            "best[vcodec!=none][acodec!=none][height<=720]/"
+            "bv*[height<=720]+ba/b"
+        )
 
     loop = asyncio.get_event_loop()
-
     try:
         log.info("[%s] downloading %s", platform, url)
         info = await loop.run_in_executor(None, lambda: _ytdlp_extract(url, opts))
-
         if info is None:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "Download failed"
 
-        # check for downloaded files
         downloads = info.get("requested_downloads") or []
-        all_files = list(out_dir.iterdir())
+        all_files  = list(out_dir.iterdir())
 
-        # detect photos (twitter, instagram, tiktok photo posts)
         images = [f for f in all_files if f.suffix.lower() in IMAGE_EXT]
         videos = [f for f in all_files if f.suffix.lower() in (".mp4", ".webm", ".mkv")]
 
@@ -573,17 +572,17 @@ async def _ytdlp_download(url, platform):
 
         if images and not videos:
             return {
-                "type": "photos",
-                "title": title,
+                "type":        "photos",
+                "title":       title,
                 "photo_paths": sorted([str(p) for p in images]),
-                "dir": str(out_dir),
+                "dir":         str(out_dir),
             }, None
 
-        # find video file
+        # ── primary path: use requested_downloads ──
         if downloads:
             filepath = downloads[0].get("filepath")
             if filepath and Path(filepath).exists():
-                # re-encode if TikTok still has bad codec (hevc, bvc2, 10-bit)
+                # TikTok codec safety check
                 if platform == "tiktok":
                     codec = await _get_video_codec(filepath)
                     SAFE_CODECS = {"h264", "avc1", "avc", "vp9", "vp8"}
@@ -600,19 +599,31 @@ async def _ytdlp_download(url, platform):
                         else:
                             shutil.rmtree(out_dir, ignore_errors=True)
                             return None, "Re-encode failed"
+
+                # FIX: verify the file actually has a video stream before treating as video
+                if not await has_video_stream(filepath):
+                    log.warning("[%s] file has no video stream — sending as audio: %s", platform, filepath)
+                    return {
+                        "type":  "audio",
+                        "path":  filepath,
+                        "title": title,
+                        "size":  Path(filepath).stat().st_size,
+                        "dir":   str(out_dir),
+                    }, None
+
                 size = Path(filepath).stat().st_size
                 return {
-                    "type": "video",
-                    "path": filepath,
-                    "title": title,
+                    "type":     "video",
+                    "path":     filepath,
+                    "title":    title,
                     "duration": info.get("duration") or 0,
-                    "width": downloads[0].get("width") or info.get("width") or 0,
-                    "height": downloads[0].get("height") or info.get("height") or 0,
-                    "size": size,
-                    "dir": str(out_dir),
+                    "width":    downloads[0].get("width") or info.get("width") or 0,
+                    "height":   downloads[0].get("height") or info.get("height") or 0,
+                    "size":     size,
+                    "dir":      str(out_dir),
                 }, None
 
-        # fallback: find any video file
+        # ── fallback: pick any video-extension file ──
         if videos:
             v = videos[0]
             if platform == "tiktok":
@@ -631,15 +642,27 @@ async def _ytdlp_download(url, platform):
                     else:
                         shutil.rmtree(out_dir, ignore_errors=True)
                         return None, "Re-encode failed"
+
+            # FIX: verify video stream before sending as video
+            if not await has_video_stream(str(v)):
+                log.warning("[%s] fallback file has no video stream — sending as audio: %s", platform, v)
+                return {
+                    "type":  "audio",
+                    "path":  str(v),
+                    "title": title,
+                    "size":  v.stat().st_size,
+                    "dir":   str(out_dir),
+                }, None
+
             return {
-                "type": "video",
-                "path": str(v),
-                "title": title,
+                "type":     "video",
+                "path":     str(v),
+                "title":    title,
                 "duration": info.get("duration") or 0,
-                "width": info.get("width") or 0,
-                "height": info.get("height") or 0,
-                "size": v.stat().st_size,
-                "dir": str(out_dir),
+                "width":    info.get("width") or 0,
+                "height":   info.get("height") or 0,
+                "size":     v.stat().st_size,
+                "dir":      str(out_dir),
             }, None
 
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -649,8 +672,6 @@ async def _ytdlp_download(url, platform):
         err = str(e)
         log.error("[%s] error: %s", platform, err[:500])
         shutil.rmtree(out_dir, ignore_errors=True)
-
-        # friendly error messages (from yt-dlp-telegram)
         lower = err.lower()
         if "sign in" in lower and "youtube" in lower:
             return None, "YouTube is blocking downloads from this server"
@@ -658,12 +679,10 @@ async def _ytdlp_download(url, platform):
             return None, "Login required or rate limited"
         if "not available" in lower:
             return None, "Content not available"
-
         return None, err.split("\n")[-1][:200]
 
 
 def _ytdlp_extract(url, opts):
-    """Run yt-dlp in thread (blocking)."""
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=True)
@@ -686,13 +705,11 @@ PIPED_INSTANCES = [
 
 
 def _extract_video_id(url):
-    """Extract YouTube video ID from URL."""
     m = re.search(r"(?:v=|shorts/|youtu\.be/)([\w-]{11})", url)
     return m.group(1) if m else None
 
 
 async def piped_download(url):
-    """Fallback for YouTube: use Piped API to get direct stream URLs."""
     vid = _extract_video_id(url)
     if not vid:
         return None, "Could not extract video ID"
@@ -701,7 +718,6 @@ async def piped_download(url):
     out_dir = DL_DIR / job
     out_dir.mkdir(exist_ok=True)
     path = str(out_dir / f"{job}.mp4")
-
     s = await get_session()
 
     try:
@@ -709,7 +725,7 @@ async def piped_download(url):
         for instance in PIPED_INSTANCES:
             try:
                 async with s.get(f"{instance}/streams/{vid}",
-                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
                     if r.status != 200:
                         continue
                     stream_data = await r.json()
@@ -725,33 +741,29 @@ async def piped_download(url):
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "All Piped instances failed"
 
-        title = stream_data.get("title", "Video")[:100]
+        title    = stream_data.get("title", "Video")[:100]
         duration = stream_data.get("duration", 0)
 
-        # find best video stream under 50MB (prefer mp4/720p)
         best_url = None
-        best_w = 0
-        best_h = 0
+        best_w = best_h = 0
         for vs in stream_data.get("videoStreams", []):
             if not vs.get("videoOnly", True) and vs.get("url"):
                 h = vs.get("height", 0)
                 if h <= 720 and h > best_h:
                     best_url = vs["url"]
-                    best_w = vs.get("width", 0)
-                    best_h = h
+                    best_w   = vs.get("width", 0)
+                    best_h   = h
 
-        # if no combined streams, try videoOnly + audio
         if not best_url:
             for vs in stream_data.get("videoStreams", []):
                 if vs.get("url"):
                     h = vs.get("height", 0)
                     if h <= 720 and h > best_h:
                         best_url = vs["url"]
-                        best_w = vs.get("width", 0)
-                        best_h = h
+                        best_w   = vs.get("width", 0)
+                        best_h   = h
 
         if not best_url:
-            # last resort: HLS
             hls = stream_data.get("hls")
             if hls:
                 best_url = hls
@@ -760,7 +772,6 @@ async def piped_download(url):
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "No suitable stream found"
 
-        # download
         async with s.get(best_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
             if r.status != 200:
                 shutil.rmtree(out_dir, ignore_errors=True)
@@ -773,19 +784,15 @@ async def piped_download(url):
         if size < 1000:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "Piped empty file"
-
         if size > MAX_TG:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, f"Too large ({size // 1048576} MB, limit 50 MB)"
 
         log.info("[piped] OK: %s (%d bytes)", title, size)
         return {
-            "type": "video",
-            "path": path,
-            "title": title,
+            "type": "video", "path": path, "title": title,
             "duration": duration, "width": best_w, "height": best_h,
-            "size": size,
-            "dir": str(out_dir),
+            "size": size, "dir": str(out_dir),
         }, None
 
     except Exception as e:
@@ -797,19 +804,19 @@ async def piped_download(url):
 # ── handle messages ──
 
 async def handle(update):
-    msg = update.get("message", {})
+    msg  = update.get("message", {})
     text = msg.get("text", "")
     chat = msg.get("chat", {}).get("id")
-    mid = msg.get("message_id")
+    mid  = msg.get("message_id")
     if not chat or not text:
         return
 
     if text.startswith("/start"):
         await send_text(chat, (
-            "\U0001f3ac Video Downloader\n\n"
+            "🎬 Video Downloader\n\n"
             "Send a link from:\n"
-            "\u2022 TikTok\n\u2022 Instagram\n\u2022 YouTube\n\u2022 X / Twitter\n\n"
-            "Works in groups \u2014 just drop a link."
+            "• TikTok\n• Instagram\n• YouTube\n• X / Twitter\n\n"
+            "Works in groups — just drop a link."
         ), mid)
         return
 
@@ -822,40 +829,42 @@ async def handle(update):
         if key in busy:
             continue
         busy.add(key)
-
         try:
-            emoji = EMOJI.get(platform, "\U0001f3ac")
-            res = await send_text(chat, f"{emoji} Downloading\u2026", mid)
-            sid = res.get("result", {}).get("message_id")
+            emoji = EMOJI.get(platform, "🎬")
+            res   = await send_text(chat, f"{emoji} Downloading…", mid)
+            sid   = res.get("result", {}).get("message_id")
 
-            # download
             result, err = await download_media(url, platform)
 
-            # YouTube: no fallback — needs cookies
             if err and platform == "youtube":
                 err = "YouTube blocked this server. Set YOUTUBE_COOKIES_BASE64 env var."
 
             if err:
                 if sid:
-                    await edit_text(chat, sid, f"\u274c {err[:300]}")
-                    asyncio.create_task(_del_later(chat, sid, 15))
+                    await edit_text(chat, sid, f"❌ {err[:300]}")
+                asyncio.create_task(_del_later(chat, sid, 15))
                 continue
 
             try:
                 if sid:
-                    await edit_text(chat, sid, "\u2b06\ufe0f Uploading\u2026")
+                    await edit_text(chat, sid, "⬆️ Uploading…")
 
                 if result["type"] == "photos":
                     paths = result["photo_paths"]
-                    cap = f"{emoji} {result['title']}"
+                    cap   = f"{emoji} {result['title']}"
                     if len(paths) == 1:
                         await send_photo(chat, paths[0], cap, mid)
                     else:
                         await send_media_group(chat, paths, cap, mid)
 
+                # FIX: route audio-only results to sendAudio instead of sendVideo
+                elif result["type"] == "audio":
+                    cap = f"{emoji} {result['title']} (audio only)"
+                    await send_audio(chat, result["path"], cap, mid)
+
                 else:
                     size_mb = result["size"] / 1048576
-                    cap = f"{emoji} {result['title']}\n{size_mb:.1f} MB"
+                    cap     = f"{emoji} {result['title']}\n{size_mb:.1f} MB"
                     await send_video(chat, result["path"], cap, mid,
                                      result["duration"], result["width"], result["height"])
 
@@ -865,13 +874,11 @@ async def handle(update):
             except Exception as e:
                 log.error("Upload: %s", e)
                 if sid:
-                    await edit_text(chat, sid, "\u274c Upload failed")
-                    asyncio.create_task(_del_later(chat, sid, 15))
-
-            finally:
-                shutil.rmtree(result.get("dir", ""), ignore_errors=True)
+                    await edit_text(chat, sid, "❌ Upload failed")
+                asyncio.create_task(_del_later(chat, sid, 15))
 
         finally:
+            shutil.rmtree(result.get("dir", "") if 'result' in dir() and result else "", ignore_errors=True)
             busy.discard(key)
 
 
@@ -889,15 +896,15 @@ async def poll():
     while True:
         try:
             async with s.get(f"{API}/getUpdates?offset={offset}&timeout=30",
-                             timeout=aiohttp.ClientTimeout(total=60)) as r:
+                              timeout=aiohttp.ClientTimeout(total=60)) as r:
                 data = await r.json()
-            if not data.get("ok"):
-                log.error("getUpdates: %s", data)
-                await asyncio.sleep(5)
-                continue
-            for u in data.get("result", []):
-                offset = u["update_id"] + 1
-                asyncio.create_task(handle(u))
+                if not data.get("ok"):
+                    log.error("getUpdates: %s", data)
+                    await asyncio.sleep(5)
+                    continue
+                for u in data.get("result", []):
+                    offset = u["update_id"] + 1
+                    asyncio.create_task(handle(u))
         except asyncio.TimeoutError:
             continue
         except Exception as e:
