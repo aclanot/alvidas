@@ -143,13 +143,26 @@ def _parse_yt_t_param(raw):
 
 
 def extract_clip_request(text, url):
-    # Supports "13:15", "1:13:15", and "5s/5 sec/5 seconds"
+    # Supports:
+    # - range: "13:20 14:12"
+    # - single point: "13:15"
+    # - optional duration: "5s/5 sec/5 seconds"
     start = None
+    end = None
     duration = None
 
-    timecode_match = re.search(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", text)
-    if timecode_match:
-        start = _parse_timecode_to_seconds(timecode_match.group(1))
+    timecode_matches = re.findall(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", text)
+    parsed_timecodes = [t for t in (_parse_timecode_to_seconds(v) for v in timecode_matches) if t is not None]
+
+    if len(parsed_timecodes) >= 2:
+        start = parsed_timecodes[0]
+        end = parsed_timecodes[1]
+        if end > start:
+            duration = end - start
+        else:
+            return None
+    elif len(parsed_timecodes) == 1:
+        start = parsed_timecodes[0]
 
     dur_match = re.search(r"\b(\d{1,4})\s*(?:s|sec|secs|second|seconds)\b", text, re.IGNORECASE)
     if dur_match:
@@ -172,8 +185,11 @@ def extract_clip_request(text, url):
         duration = 5
 
     # Keep sane limits
-    duration = max(1, min(duration, 180))
-    return {"start": start, "duration": duration}
+    duration = max(1, min(duration, 900))
+    clip = {"start": start, "duration": duration}
+    if end is not None:
+        clip["end"] = end
+    return clip
 
 
 # ── telegram API ──
@@ -977,7 +993,10 @@ async def handle(update):
                     size_mb = result["size"] / 1048576
                     clip_note = ""
                     if clip_request:
-                        clip_note = f"\nClip: {clip_request['start']}s +{clip_request['duration']}s"
+                        if "end" in clip_request:
+                            clip_note = f"\nClip: {clip_request['start']}s → {clip_request['end']}s"
+                        else:
+                            clip_note = f"\nClip: {clip_request['start']}s +{clip_request['duration']}s"
                     cap     = f"{emoji} {result['title']}\n{size_mb:.1f} MB{clip_note}"
                     await send_video(chat, result["path"], cap, mid,
                                      result["duration"], result["width"], result["height"])
