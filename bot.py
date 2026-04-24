@@ -8,7 +8,7 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 import yt_dlp
@@ -116,6 +116,80 @@ def find_urls(text):
                 if url not in [u for _, u in found]:
                     found.append((platform, url))
     return found
+
+
+def _parse_timecode_to_seconds(value):
+    parts = value.split(":")
+    if len(parts) == 2:
+        mm, ss = parts
+        return int(mm) * 60 + int(ss)
+    if len(parts) == 3:
+        hh, mm, ss = parts
+        return int(hh) * 3600 + int(mm) * 60 + int(ss)
+    return None
+
+
+def _parse_yt_t_param(raw):
+    if raw.isdigit():
+        return int(raw)
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", raw.strip().lower())
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    sec = int(m.group(3) or 0)
+    total = h * 3600 + mins * 60 + sec
+    return total if total > 0 else None
+
+
+def extract_clip_request(text, url):
+    # Supports:
+    # - range: "13:20 14:12"
+    # - single point: "13:15"
+    # - optional duration: "5s/5 sec/5 seconds"
+    start = None
+    end = None
+    duration = None
+
+    timecode_matches = re.findall(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", text)
+    parsed_timecodes = [t for t in (_parse_timecode_to_seconds(v) for v in timecode_matches) if t is not None]
+
+    if len(parsed_timecodes) >= 2:
+        start = parsed_timecodes[0]
+        end = parsed_timecodes[1]
+        if end > start:
+            duration = end - start
+        else:
+            return None
+    elif len(parsed_timecodes) == 1:
+        start = parsed_timecodes[0]
+
+    dur_match = re.search(r"\b(\d{1,4})\s*(?:s|sec|secs|second|seconds)\b", text, re.IGNORECASE)
+    if dur_match:
+        duration = int(dur_match.group(1))
+
+    if start is None:
+        try:
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            t_raw = (params.get("t") or [None])[0]
+            if t_raw:
+                start = _parse_yt_t_param(t_raw)
+        except Exception:
+            start = None
+
+    if start is None:
+        return None
+
+    if duration is None:
+        duration = 5
+
+    # Keep sane limits
+    duration = max(1, min(duration, 900))
+    clip = {"start": start, "duration": duration}
+    if end is not None:
+        clip["end"] = end
+    return clip
 
 
 # ── telegram API ──
@@ -478,6 +552,34 @@ async def _ffprobe(path):
         return 0, 0, 0
 
 
+async def cut_video_clip(input_path, output_path, start_sec, duration_sec):
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-t", str(duration_sec),
+            "-i", input_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            output_path,
+        ]
+        p = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(p.communicate(), 180)
+        if p.returncode != 0:
+            log.error("[clip] ffmpeg failed: %s", stderr.decode()[:300] if stderr else "")
+            return False
+        return Path(output_path).exists() and Path(output_path).stat().st_size > 0
+    except Exception as e:
+        log.error("[clip] %s", e)
+        return False
+
+
 # FIX: helper to confirm a file actually contains a video stream
 async def has_video_stream(path):
     """Return True if the file contains at least one video stream."""
@@ -836,7 +938,32 @@ async def handle(update):
 
             result, err = await download_media(url, platform)
 
-            if err and platform == "youtube":
+            clip_request = None
+            if platform == "youtube":
+                clip_request = extract_clip_request(text, url)
+                if clip_request and result and result.get("type") == "video":
+                    clip_path = str(Path(result["dir"]) / "clip.mp4")
+                    ok = await cut_video_clip(
+                        result["path"],
+                        clip_path,
+                        clip_request["start"],
+                        clip_request["duration"],
+                    )
+                    if ok:
+                        try:
+                            os.remove(result["path"])
+                        except Exception:
+                            pass
+                        dur, w, h = await _ffprobe(clip_path)
+                        result["path"] = clip_path
+                        result["size"] = Path(clip_path).stat().st_size
+                        result["duration"] = dur
+                        result["width"] = w or result.get("width", 0)
+                        result["height"] = h or result.get("height", 0)
+                    else:
+                        err = "Could not cut requested clip"
+
+            if err and platform == "youtube" and "sign in" in err.lower():
                 err = "YouTube blocked this server. Set YOUTUBE_COOKIES_BASE64 env var."
 
             if err:
@@ -864,7 +991,13 @@ async def handle(update):
 
                 else:
                     size_mb = result["size"] / 1048576
-                    cap     = f"{emoji} {result['title']}\n{size_mb:.1f} MB"
+                    clip_note = ""
+                    if clip_request:
+                        if "end" in clip_request:
+                            clip_note = f"\nClip: {clip_request['start']}s → {clip_request['end']}s"
+                        else:
+                            clip_note = f"\nClip: {clip_request['start']}s +{clip_request['duration']}s"
+                    cap     = f"{emoji} {result['title']}\n{size_mb:.1f} MB{clip_note}"
                     await send_video(chat, result["path"], cap, mid,
                                      result["duration"], result["width"], result["height"])
 
