@@ -7,6 +7,7 @@ import random
 import asyncio
 import logging
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -29,7 +30,9 @@ if not COBALT_API_URL.endswith("/"):
 COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 MAX_TG = 50 * 1024 * 1024
 TG_CAPTION_LIMIT = 1024
+SHORT_DESCRIPTION_LIMIT = 300
 DESCRIPTION_CHUNK_LIMIT = 3900
+DESCRIPTION_CACHE_TTL = 3600
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
 COOKIE_DIR = DL_DIR / "cookies"
@@ -106,6 +109,7 @@ EMOJI = {"tiktok": "🎵", "instagram": "📷", "twitter": "𝕏", "youtube": "�
 
 session: aiohttp.ClientSession = None
 busy = set()
+description_cache = {}
 
 
 async def get_session():
@@ -1115,7 +1119,7 @@ def make_caption(emoji, title, description="", extra=""):
         lines.append(extra.strip())
     base = "\n\n".join([line for line in lines if line])
     description = (description or "").strip()
-    if not description or description in base:
+    if not description or description in base or len(description) > SHORT_DESCRIPTION_LIMIT:
         return base[:TG_CAPTION_LIMIT]
 
     full = f"{base}\n\n{description}" if base else description
@@ -1140,13 +1144,48 @@ def split_text(text, limit=DESCRIPTION_CHUNK_LIMIT):
         yield text
 
 
-async def send_description_if_needed(chat, emoji, result, caption, reply):
+def cleanup_description_cache():
+    now = time.time()
+    expired = [
+        key for key, item in description_cache.items()
+        if now - item.get("created", now) > DESCRIPTION_CACHE_TTL
+    ]
+    for key in expired:
+        description_cache.pop(key, None)
+
+
+def store_description(description):
+    cleanup_description_cache()
+    key = os.urandom(5).hex()
+    description_cache[key] = {"text": description, "created": time.time()}
+    return key
+
+
+def description_keyboard(key):
+    return {
+        "inline_keyboard": [[
+            {"text": "Show description", "callback_data": f"desc:{key}"},
+        ]]
+    }
+
+
+async def send_description_button_if_needed(chat, status_mid, emoji, result, caption, reply):
     description = (result.get("description") or "").strip()
-    if not description or description in caption:
-        return
-    for i, chunk in enumerate(split_text(description)):
-        prefix = f"{emoji} Description:\n" if i == 0 else ""
-        await send_text(chat, f"{prefix}{chunk}", reply)
+    if not description or description in caption or len(description) <= SHORT_DESCRIPTION_LIMIT:
+        return False
+
+    key = store_description(description)
+    text = f"{emoji} Description is long ({len(description)} chars)"
+    try:
+        if status_mid:
+            await edit_text(chat, status_mid, text, description_keyboard(key))
+        else:
+            await send_text(chat, text, reply, description_keyboard(key))
+        return True
+    except Exception as e:
+        description_cache.pop(key, None)
+        log.warning("[description] button failed: %s", e)
+        return False
 
 
 async def download_media(url, platform):
@@ -1484,6 +1523,22 @@ async def handle_callback(callback):
     if not chat or not mid:
         return
 
+    if data.startswith("desc:"):
+        cleanup_description_cache()
+        key = data.split(":", 1)[1]
+        item = description_cache.get(key)
+        if not item:
+            await edit_text(chat, mid, "Description expired")
+            asyncio.create_task(_del_later(chat, mid, 15))
+            return
+        for i, chunk in enumerate(split_text(item["text"])):
+            prefix = "Description:\n" if i == 0 else ""
+            await send_text(chat, f"{prefix}{chunk}", mid)
+        description_cache.pop(key, None)
+        await edit_text(chat, mid, "Description sent")
+        asyncio.create_task(_del_later(chat, mid, 15))
+        return
+
     if data == "proxy_check":
         await edit_text(chat, mid, "Checking proxies...", proxy_keyboard())
         text = await check_proxies_text()
@@ -1582,6 +1637,7 @@ async def handle(update):
                 continue
 
             try:
+                keep_status = False
                 if sid:
                     await edit_text(chat, sid, "⬆️ Uploading…")
 
@@ -1597,13 +1653,11 @@ async def handle(update):
                             await send_media_group(chat, chunk, chunk_caption, mid)
                     if result.get("audio_path"):
                         await send_audio(chat, result["audio_path"], make_caption(emoji, result["title"], extra="Audio"), mid)
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
                 # FIX: route audio-only results to sendAudio instead of sendVideo
                 elif result["type"] == "audio":
                     cap = make_caption(emoji, result["title"], result.get("description", ""), "audio only")
                     await send_audio(chat, result["path"], cap, mid)
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
                 else:
                     size_mb = result["size"] / 1048576
@@ -1616,9 +1670,10 @@ async def handle(update):
                     cap     = make_caption(emoji, result["title"], result.get("description", ""), f"{size_mb:.1f} MB{clip_note}")
                     await send_video(chat, result["path"], cap, mid,
                                      result["duration"], result["width"], result["height"])
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
-                if sid:
+                keep_status = await send_description_button_if_needed(chat, sid, emoji, result, cap, mid)
+
+                if sid and not keep_status:
                     await delete_msg(chat, sid)
 
             except Exception as e:
@@ -1663,10 +1718,10 @@ async def poll():
 
 
 async def cleanup():
-    import time
     while True:
         await asyncio.sleep(300)
         try:
+            cleanup_description_cache()
             for d in DL_DIR.iterdir():
                 if d.is_dir() and d.name != "cookies" and time.time() - d.stat().st_mtime > 300:
                     shutil.rmtree(d, ignore_errors=True)
