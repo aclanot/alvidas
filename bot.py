@@ -21,6 +21,12 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
 PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
+COBALT_API_URL = (os.environ.get("COBALT_API_URL") or "https://api.cobalt.tools/").strip()
+if not COBALT_API_URL:
+    COBALT_API_URL = "https://api.cobalt.tools/"
+if not COBALT_API_URL.endswith("/"):
+    COBALT_API_URL += "/"
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 MAX_TG = 50 * 1024 * 1024
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
@@ -721,6 +727,19 @@ async def has_video_stream(path):
         return True  # assume video on error, preserve old behaviour
 
 
+async def _has_video_stream_strict(path):
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type", "-of", "json", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        data = json.loads(out)
+        return len(data.get("streams", [])) > 0
+    except Exception:
+        return False
+
+
 # ── download with yt-dlp as Python library ──
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -816,6 +835,33 @@ def _ext_from_url(url, default_ext):
     return default_ext
 
 
+def _ext_from_content_type(content_type, default_ext):
+    content_type = (content_type or "").split(";")[0].strip().lower()
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/ogg": ".ogg",
+        "audio/webm": ".webm",
+    }.get(content_type, default_ext)
+
+
+def _ext_from_cobalt(filename, media_url, content_type, default_ext):
+    ext = Path(filename or "").suffix.lower()
+    if ext and len(ext) <= 6:
+        return ext
+    ext = _ext_from_content_type(content_type, "")
+    if ext:
+        return ext
+    return _ext_from_url(media_url, default_ext)
+
+
 async def _download_url(url, path, headers=None, timeout=60):
     s = await get_session()
     async with s.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
@@ -869,118 +915,195 @@ def _description_from_info(info):
     return ""
 
 
+async def _download_cobalt_media(s, media_url, out_dir, stem, default_ext, filename=None, timeout=90):
+    tmp_path = out_dir / f"{stem}.tmp"
+    try:
+        async with s.get(media_url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            if r.status != 200:
+                return None
+            content_type = r.headers.get("Content-Type", "")
+            if content_type.split(";")[0].strip().lower() in {"application/json", "text/html", "text/plain"}:
+                return None
+            with open(tmp_path, "wb") as f:
+                async for chunk in r.content.iter_chunked(65536):
+                    f.write(chunk)
+
+        if not tmp_path.exists() or tmp_path.stat().st_size < 100:
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+        ext = _ext_from_cobalt(filename, media_url, content_type, default_ext)
+        path = out_dir / f"{stem}{ext}"
+        tmp_path.replace(path)
+        return str(path)
+    except Exception as e:
+        log.warning("[instagram/cobalt] file download failed: %s", e)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
 async def _instagram_fast(url):
-    shortcode = _instagram_shortcode_from_url(url)
-    cookie = _cookie_header("instagram")
-    if not shortcode or not cookie:
-        return None, None
-
-    job = os.urandom(5).hex()
-    out_dir = DL_DIR / job
-    out_dir.mkdir(exist_ok=True)
-
+    """Download Instagram via cobalt API without Instagram cookies."""
+    s = await get_session()
     headers = {
-        "User-Agent": "Instagram 219.0.0.12.117 Android",
-        "Accept": "*/*",
-        "X-IG-App-ID": "936619743392459",
-        "X-ASBD-ID": "198387",
-        "Origin": "https://www.instagram.com",
-        "Referer": url,
-        "Cookie": cookie,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+
+    payload = {
+        "url": url,
+        "videoQuality": "1080",
+        "filenameStyle": "basic",
+    }
+    out_dir = None
 
     try:
-        s = await get_session()
-        pk = _instagram_shortcode_to_pk(shortcode)
-        async with s.get(
-            f"https://i.instagram.com/api/v1/media/{pk}/info/",
+        async with s.post(
+            COBALT_API_URL,
+            json=payload,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as r:
             if r.status != 200:
-                shutil.rmtree(out_dir, ignore_errors=True)
+                body = await r.text()
+                log.info("[instagram/cobalt] API HTTP %s: %s", r.status, body[:160])
                 return None, None
-            data = await r.json()
+            data = await r.json(content_type=None)
 
-        item = (data.get("items") or [None])[0]
-        if not item:
+        status = data.get("status")
+        if status == "error":
+            error = data.get("error") or {}
+            log.warning("[instagram/cobalt] error=%s", error.get("code") or error)
+            return None, None
+        if status not in ("tunnel", "redirect", "stream", "picker"):
+            log.info("[instagram/cobalt] unsupported status=%s", status)
+            return None, None
+
+        job = os.urandom(5).hex()
+        out_dir = DL_DIR / job
+        out_dir.mkdir(exist_ok=True)
+        title = "Instagram"
+
+        if status == "picker":
+            photo_paths = []
+            video_paths = []
+            for i, item in enumerate((data.get("picker") or [])[:10]):
+                item_url = item.get("url")
+                if not item_url:
+                    continue
+                item_type = item.get("type")
+                if item_type in ("video", "gif"):
+                    path = await _download_cobalt_media(s, item_url, out_dir, f"video_{i}", ".mp4", timeout=90)
+                    if path and await _has_video_stream_strict(path):
+                        video_paths.append(path)
+                    elif path:
+                        Path(path).unlink(missing_ok=True)
+                    continue
+
+                path = await _download_cobalt_media(s, item_url, out_dir, f"photo_{i}", ".jpg", timeout=30)
+                if path:
+                    photo_paths.append(path)
+
+            audio_path = None
+            audio_url = data.get("audio")
+            if audio_url:
+                audio_path = await _download_cobalt_media(
+                    s, audio_url, out_dir, "audio", ".m4a", data.get("audioFilename"), timeout=60
+                )
+
+            if photo_paths:
+                log.info("[instagram/cobalt] %d photos, audio=%s", len(photo_paths), bool(audio_path))
+                return {
+                    "type": "photos",
+                    "title": title,
+                    "description": "",
+                    "photo_paths": photo_paths,
+                    "audio_path": audio_path,
+                    "dir": str(out_dir),
+                }, None
+
+            if video_paths:
+                path = video_paths[0]
+                dur, w, h = await _ffprobe(path)
+                size = Path(path).stat().st_size
+                log.info("[instagram/cobalt] picker video OK: %d bytes", size)
+                return {
+                    "type": "video",
+                    "path": path,
+                    "title": title,
+                    "description": "",
+                    "duration": dur,
+                    "width": w,
+                    "height": h,
+                    "size": size,
+                    "dir": str(out_dir),
+                }, None
+
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None
 
-        user = item.get("user") or {}
-        username = user.get("username") or "instagram"
-        title = (item.get("title") or f"Instagram by {username}")[:100]
-        description = _instagram_description(item)
+        media_url = data.get("url")
+        if not media_url:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
 
-        media_items = item.get("carousel_media") or [item]
-        photo_paths = []
-        video_paths = []
+        path = await _download_cobalt_media(
+            s, media_url, out_dir, job, ".mp4", data.get("filename"), timeout=90
+        )
+        if not path:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
 
-        for i, media in enumerate(media_items):
-            media_type = media.get("media_type")
-            if media_type == 2:
-                video_url = _pick_instagram_video_url(media)
-                if not video_url:
-                    continue
-                video_path = out_dir / f"video_{i}{_ext_from_url(video_url, '.mp4')}"
-                if await _download_url(video_url, str(video_path), headers=headers):
-                    video_paths.append(str(video_path))
-                continue
-
-            image_url = _pick_instagram_image_url(media)
-            if not image_url:
-                continue
-            image_path = out_dir / f"photo_{i}{_ext_from_url(image_url, '.jpg')}"
-            if await _download_url(image_url, str(image_path), headers=headers, timeout=20):
-                photo_paths.append(str(image_path))
-
-        audio_path = None
-        audio_url = _instagram_audio_url(item)
-        if audio_url:
-            candidate = out_dir / f"audio{_ext_from_url(audio_url, '.m4a')}"
-            if await _download_url(audio_url, str(candidate), headers=headers, timeout=60):
-                audio_path = str(candidate)
-
-        if not audio_path and photo_paths and video_paths:
-            for video_path in video_paths:
-                if await has_audio_stream(video_path):
-                    candidate = str(out_dir / "audio.m4a")
-                    if await _extract_audio(video_path, candidate):
-                        audio_path = candidate
-                    break
-
-        if photo_paths:
-            log.info("[instagram/api] %d photos, audio=%s", len(photo_paths), bool(audio_path))
+        suffix = Path(path).suffix.lower()
+        size = Path(path).stat().st_size
+        if suffix in IMAGE_EXT:
+            log.info("[instagram/cobalt] photo OK: %d bytes", size)
             return {
                 "type": "photos",
                 "title": title,
-                "description": description,
-                "photo_paths": photo_paths,
-                "audio_path": audio_path,
+                "description": "",
+                "photo_paths": [path],
+                "audio_path": None,
                 "dir": str(out_dir),
             }, None
 
-        if video_paths:
-            path = video_paths[0]
-            dur, w, h = await _ffprobe(path)
-            return {
-                "type": "video",
-                "path": path,
-                "title": title,
-                "description": description,
-                "duration": dur,
-                "width": w,
-                "height": h,
-                "size": Path(path).stat().st_size,
-                "dir": str(out_dir),
-            }, None
+        if not await _has_video_stream_strict(path):
+            if await has_audio_stream(path):
+                log.info("[instagram/cobalt] audio OK: %d bytes", size)
+                return {
+                    "type": "audio",
+                    "path": path,
+                    "title": title,
+                    "description": "",
+                    "size": size,
+                    "dir": str(out_dir),
+                }, None
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
 
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return None, None
+        dur, w, h = await _ffprobe(path)
+        log.info("[instagram/cobalt] video OK: %d bytes", size)
+        return {
+            "type": "video",
+            "path": path,
+            "title": title,
+            "description": "",
+            "duration": dur,
+            "width": w,
+            "height": h,
+            "size": size,
+            "dir": str(out_dir),
+        }, None
 
     except Exception as e:
-        log.warning("[instagram/api] %s", e)
-        shutil.rmtree(out_dir, ignore_errors=True)
+        log.warning("[instagram/cobalt] %s", e)
+        if out_dir:
+            shutil.rmtree(out_dir, ignore_errors=True)
         return None, None
 
 
@@ -1004,6 +1127,7 @@ async def download_media(url, platform):
         result, err = await _instagram_fast(url)
         if result:
             return result, None
+        log.info("[instagram] cobalt failed, falling back to yt-dlp")
 
     if platform == "twitter":
         result, err = await _twitter_fast(url)
