@@ -28,6 +28,8 @@ if not COBALT_API_URL.endswith("/"):
     COBALT_API_URL += "/"
 COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 MAX_TG = 50 * 1024 * 1024
+TG_CAPTION_LIMIT = 1024
+DESCRIPTION_CHUNK_LIMIT = 3900
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
 COOKIE_DIR = DL_DIR / "cookies"
@@ -346,7 +348,7 @@ async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
     d.add_field("video", open(path, "rb"), filename="video.mp4", content_type="video/mp4")
-    d.add_field("caption", caption[:1024])
+    d.add_field("caption", caption[:TG_CAPTION_LIMIT])
     d.add_field("supports_streaming", "true")
     if reply:
         d.add_field("reply_to_message_id", str(reply))
@@ -375,7 +377,7 @@ async def send_audio(chat, path, caption, reply):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
     d.add_field("audio", open(path, "rb"), filename=filename, content_type=ct)
-    d.add_field("caption", caption[:1024])
+    d.add_field("caption", caption[:TG_CAPTION_LIMIT])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
     return await tg("sendAudio", d, 60)
@@ -386,7 +388,7 @@ async def send_photo(chat, path, caption, reply):
     d.add_field("chat_id", str(chat))
     d.add_field("photo", open(path, "rb"), filename="photo.jpg", content_type="image/jpeg")
     if caption:
-        d.add_field("caption", caption[:1024])
+        d.add_field("caption", caption[:TG_CAPTION_LIMIT])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
     return await tg("sendPhoto", d, 60)
@@ -403,7 +405,7 @@ async def send_media_group(chat, paths, caption, reply):
         d.add_field(key, open(p, "rb"), filename=f"{key}.jpg", content_type="image/jpeg")
         entry = {"type": "photo", "media": f"attach://{key}"}
         if i == 0 and caption:
-            entry["caption"] = caption[:1024]
+            entry["caption"] = caption[:TG_CAPTION_LIMIT]
         media.append(entry)
     d.add_field("media", json.dumps(media))
     return await tg("sendMediaGroup", d, 120)
@@ -1111,15 +1113,40 @@ def make_caption(emoji, title, description="", extra=""):
     lines = [f"{emoji} {title}".strip()]
     if extra:
         lines.append(extra.strip())
-    if description and description.strip() and description.strip() not in lines[0]:
-        lines.append(description.strip())
-    return "\n\n".join([line for line in lines if line])[:1024]
+    base = "\n\n".join([line for line in lines if line])
+    description = (description or "").strip()
+    if not description or description in base:
+        return base[:TG_CAPTION_LIMIT]
+
+    full = f"{base}\n\n{description}" if base else description
+    if len(full) <= TG_CAPTION_LIMIT:
+        return full
+    return base[:TG_CAPTION_LIMIT]
+
+
+def split_text(text, limit=DESCRIPTION_CHUNK_LIMIT):
+    text = (text or "").strip()
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunk = text[:cut].strip()
+        if chunk:
+            yield chunk
+        text = text[cut:].strip()
+    if text:
+        yield text
 
 
 async def send_description_if_needed(chat, emoji, result, caption, reply):
     description = (result.get("description") or "").strip()
-    if description and description not in caption:
-        await send_text(chat, f"{emoji} Description:\n{description[:3900]}", reply)
+    if not description or description in caption:
+        return
+    for i, chunk in enumerate(split_text(description)):
+        prefix = f"{emoji} Description:\n" if i == 0 else ""
+        await send_text(chat, f"{prefix}{chunk}", reply)
 
 
 async def download_media(url, platform):
