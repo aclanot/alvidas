@@ -935,6 +935,91 @@ def _description_from_info(info):
     return ""
 
 
+def _best_thumbnail_url(info):
+    direct_url = info.get("url")
+    if direct_url and (_ext_from_url(direct_url, "").lower() in IMAGE_EXT or "scontent" in direct_url):
+        return direct_url
+    thumbnails = info.get("thumbnails") or []
+    thumbnails = [t for t in thumbnails if t.get("url")]
+    if thumbnails:
+        best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        return best.get("url")
+    return info.get("thumbnail") or info.get("display_url") or info.get("thumbnail_url")
+
+
+def _collect_image_urls_from_info(info):
+    urls = []
+
+    def add(url):
+        if url and url not in urls:
+            urls.append(url)
+
+    def walk(item):
+        if not isinstance(item, dict):
+            return
+        entries = item.get("entries")
+        if entries:
+            for entry in entries:
+                walk(entry)
+            return
+        formats = item.get("formats") or []
+        has_video = any((f.get("vcodec") or "none") != "none" for f in formats)
+        if not has_video:
+            add(_best_thumbnail_url(item))
+
+    walk(info)
+    return urls
+
+
+async def _instagram_images_from_ytdlp(url):
+    job = os.urandom(5).hex()
+    out_dir = DL_DIR / job
+    out_dir.mkdir(exist_ok=True)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": False,
+        "ignore_no_formats_error": True,
+    }
+    cookie = COOKIES.get("instagram")
+    if cookie:
+        opts["cookiefile"] = cookie
+
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(None, lambda: _ytdlp_extract(url, opts, download=False))
+        image_urls = _collect_image_urls_from_info(info)[:20]
+        photo_paths = []
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.instagram.com/"}
+        for i, image_url in enumerate(image_urls):
+            path = out_dir / f"photo_{i}{_ext_from_url(image_url, '.jpg')}"
+            if await _download_url(image_url, str(path), headers=headers, timeout=30) and _looks_like_image(path):
+                photo_paths.append(str(path))
+            else:
+                path.unlink(missing_ok=True)
+
+        if not photo_paths:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, None
+
+        title = (info.get("title") or "Instagram")[:100]
+        description = _description_from_info(info)
+        log.info("[instagram/ytdlp-images] %d photos", len(photo_paths))
+        return {
+            "type": "photos",
+            "title": title,
+            "description": description,
+            "photo_paths": photo_paths,
+            "audio_path": None,
+            "dir": str(out_dir),
+        }, None
+    except Exception as e:
+        log.warning("[instagram/ytdlp-images] %s", e)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, None
+
+
 async def _download_cobalt_media(s, media_url, out_dir, stem, default_ext, filename=None, timeout=90):
     tmp_path = out_dir / f"{stem}.tmp"
     try:
@@ -1219,6 +1304,15 @@ async def download_media(url, platform):
         if result:
             return result, None
         log.info("[instagram] cobalt failed, falling back to yt-dlp")
+        result, err = await _ytdlp_download(url, platform)
+        if result:
+            return result, None
+        if err and "no video formats" in err.lower():
+            result, image_err = await _instagram_images_from_ytdlp(url)
+            if result:
+                return result, None
+            return None, image_err or err
+        return None, err
 
     if platform == "twitter":
         result, err = await _twitter_fast(url)
@@ -1415,10 +1509,10 @@ async def _ytdlp_download(url, platform):
         return None, err.split("\n")[-1][:200]
 
 
-def _ytdlp_extract(url, opts):
+def _ytdlp_extract(url, opts, download=True):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
+            return ydl.extract_info(url, download=download)
     except Exception as e:
         raise e
 
