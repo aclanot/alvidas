@@ -1173,17 +1173,23 @@ def cleanup_description_cache():
         description_cache.pop(key, None)
 
 
-def store_description(description):
+def store_description(description, control_text):
     cleanup_description_cache()
     key = os.urandom(5).hex()
-    description_cache[key] = {"text": description, "created": time.time()}
+    description_cache[key] = {
+        "text": description,
+        "control_text": control_text,
+        "created": time.time(),
+        "message_ids": [],
+    }
     return key
 
 
-def description_keyboard(key):
+def description_keyboard(key, shown=False):
+    text = "Hide description" if shown else "Show description"
     return {
         "inline_keyboard": [[
-            {"text": "Show description", "callback_data": f"desc:{key}"},
+            {"text": text, "callback_data": f"desc:{key}"},
         ]]
     }
 
@@ -1193,8 +1199,8 @@ async def send_description_button_if_needed(chat, status_mid, emoji, result, cap
     if not description or description in caption or len(description) <= SHORT_DESCRIPTION_LIMIT:
         return False
 
-    key = store_description(description)
     text = f"{emoji} Description is long ({len(description)} chars)"
+    key = store_description(description, text)
     try:
         if status_mid:
             await edit_text(chat, status_mid, text, description_keyboard(key))
@@ -1550,11 +1556,23 @@ async def handle_callback(callback):
             await edit_text(chat, mid, "Description expired")
             asyncio.create_task(_del_later(chat, mid, 15))
             return
+
+        if item.get("message_ids"):
+            for message_id in item["message_ids"]:
+                await delete_msg(chat, message_id)
+            item["message_ids"] = []
+            await edit_text(chat, mid, item.get("control_text", "Description is hidden"), description_keyboard(key))
+            return
+
+        message_ids = []
         for i, chunk in enumerate(split_text(item["text"])):
             prefix = "Description:\n" if i == 0 else ""
-            await send_text(chat, f"{prefix}{chunk}", mid)
-        description_cache.pop(key, None)
-        await delete_msg(chat, mid)
+            res = await send_text(chat, f"{prefix}{chunk}", mid)
+            sent_mid = res.get("result", {}).get("message_id")
+            if sent_mid:
+                message_ids.append(sent_mid)
+        item["message_ids"] = message_ids
+        await edit_text(chat, mid, f"Description shown ({len(item['text'])} chars)", description_keyboard(key, shown=True))
         return
 
     if data == "proxy_check":
