@@ -868,6 +868,20 @@ def _ext_from_cobalt(filename, media_url, content_type, default_ext):
     return _ext_from_url(media_url, default_ext)
 
 
+def _looks_like_image(path):
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except Exception:
+        return False
+    return (
+        header.startswith(b"\xff\xd8\xff")
+        or header.startswith(b"\x89PNG\r\n\x1a\n")
+        or header.startswith((b"GIF87a", b"GIF89a"))
+        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+    )
+
+
 async def _download_url(url, path, headers=None, timeout=60):
     s = await get_session()
     async with s.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
@@ -1003,17 +1017,22 @@ async def _instagram_fast(url):
                 if not item_url:
                     continue
                 item_type = item.get("type")
-                if item_type in ("video", "gif"):
-                    path = await _download_cobalt_media(s, item_url, out_dir, f"video_{i}", ".mp4", timeout=90)
-                    if path and await _has_video_stream_strict(path):
-                        video_paths.append(path)
-                    elif path:
-                        Path(path).unlink(missing_ok=True)
+                default_ext = ".jpg" if item_type in ("photo", "image") else ".mp4"
+                timeout = 30 if default_ext == ".jpg" else 90
+                path = await _download_cobalt_media(
+                    s, item_url, out_dir, f"item_{i}", default_ext, item.get("filename"), timeout=timeout
+                )
+                if not path:
                     continue
 
-                path = await _download_cobalt_media(s, item_url, out_dir, f"photo_{i}", ".jpg", timeout=30)
-                if path:
+                suffix = Path(path).suffix.lower()
+                if await _has_video_stream_strict(path):
+                    video_paths.append(path)
+                    continue
+                if suffix in IMAGE_EXT or _looks_like_image(path):
                     photo_paths.append(path)
+                    continue
+                Path(path).unlink(missing_ok=True)
 
             audio_path = None
             audio_url = data.get("audio")
@@ -1022,22 +1041,11 @@ async def _instagram_fast(url):
                     s, audio_url, out_dir, "audio", ".m4a", data.get("audioFilename"), timeout=60
                 )
 
-            if photo_paths:
-                log.info("[instagram/cobalt] %d photos, audio=%s", len(photo_paths), bool(audio_path))
-                return {
-                    "type": "photos",
-                    "title": title,
-                    "description": "",
-                    "photo_paths": photo_paths,
-                    "audio_path": audio_path,
-                    "dir": str(out_dir),
-                }, None
-
             if video_paths:
                 path = video_paths[0]
                 dur, w, h = await _ffprobe(path)
                 size = Path(path).stat().st_size
-                log.info("[instagram/cobalt] picker video OK: %d bytes", size)
+                log.info("[instagram/cobalt] picker video OK: %d bytes, photos=%d", size, len(photo_paths))
                 return {
                     "type": "video",
                     "path": path,
@@ -1047,6 +1055,17 @@ async def _instagram_fast(url):
                     "width": w,
                     "height": h,
                     "size": size,
+                    "dir": str(out_dir),
+                }, None
+
+            if photo_paths:
+                log.info("[instagram/cobalt] %d photos, audio=%s", len(photo_paths), bool(audio_path))
+                return {
+                    "type": "photos",
+                    "title": title,
+                    "description": "",
+                    "photo_paths": photo_paths,
+                    "audio_path": audio_path,
                     "dir": str(out_dir),
                 }, None
 
