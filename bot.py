@@ -1554,8 +1554,7 @@ async def handle_callback(callback):
             prefix = "Description:\n" if i == 0 else ""
             await send_text(chat, f"{prefix}{chunk}", mid)
         description_cache.pop(key, None)
-        await edit_text(chat, mid, "Description sent")
-        asyncio.create_task(_del_later(chat, mid, 15))
+        await delete_msg(chat, mid)
         return
 
     if data == "proxy_check":
