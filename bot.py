@@ -405,6 +405,44 @@ async def send_media_group(chat, paths, caption, reply):
 
 # ── fast paths: direct API downloads ──
 
+def _twitter_video_url(video):
+    candidates = []
+    for key in ("formats", "variants"):
+        for item in video.get(key) or []:
+            media_url = item.get("url", "")
+            content_type = (item.get("content_type") or "").lower()
+            container = (item.get("container") or "").lower()
+            if not media_url:
+                continue
+            if ".mp4" not in media_url and content_type != "video/mp4" and container != "mp4":
+                continue
+
+            width = item.get("width") or 0
+            height = item.get("height") or 0
+            if not width or not height:
+                m = re.search(r"/(\d+)x(\d+)/", media_url)
+                if m:
+                    width, height = int(m.group(1)), int(m.group(2))
+
+            candidates.append({
+                "url": media_url,
+                "bitrate": item.get("bitrate") or 0,
+                "width": width,
+                "height": height,
+            })
+
+    if not candidates:
+        return video.get("url", ""), video.get("width", 0), video.get("height", 0), 0
+
+    preferred = [
+        c for c in candidates
+        if c["height"] and c["height"] <= 540 and (not c["bitrate"] or c["bitrate"] <= 1200000)
+    ]
+    playable = [c for c in candidates if not c["height"] or c["height"] <= 720]
+    chosen = max(preferred or playable or candidates, key=lambda c: (c["height"], c["bitrate"]))
+    return chosen["url"], chosen["width"], chosen["height"], chosen["bitrate"]
+
+
 async def _twitter_fast(url):
     """Download Twitter/X via fxtwitter API — instant, no yt-dlp."""
     m = re.search(r"(?:twitter\.com|x\.com)/(\w+)/status/(\d+)", url)
@@ -434,7 +472,7 @@ async def _twitter_fast(url):
             out_dir.mkdir(exist_ok=True)
 
             if videos:
-                video_url = videos[0].get("url", "")
+                video_url, chosen_w, chosen_h, chosen_bitrate = _twitter_video_url(videos[0])
                 if not video_url:
                     return None, None
                 path = str(out_dir / f"{job}.mp4")
@@ -449,7 +487,9 @@ async def _twitter_fast(url):
                     shutil.rmtree(out_dir, ignore_errors=True)
                     return None, None
                 dur, w, h = await _ffprobe(path)
-                log.info("[twitter/fxtwitter] OK: %s (%d bytes)", title, size)
+                w = w or chosen_w
+                h = h or chosen_h
+                log.info("[twitter/fxtwitter] OK: %s (%d bytes, %sp, %s bps)", title, size, h or "?", chosen_bitrate or "?")
                 return {"type": "video", "path": path, "title": title,
                         "duration": dur, "width": w, "height": h,
                         "size": size, "dir": str(out_dir)}, None
