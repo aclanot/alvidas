@@ -7,7 +7,6 @@ import random
 import asyncio
 import logging
 import tempfile
-import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -22,17 +21,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
 PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
-COBALT_API_URL = (os.environ.get("COBALT_API_URL") or "https://api.cobalt.tools/").strip()
-if not COBALT_API_URL:
-    COBALT_API_URL = "https://api.cobalt.tools/"
-if not COBALT_API_URL.endswith("/"):
-    COBALT_API_URL += "/"
-COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 MAX_TG = 50 * 1024 * 1024
-TG_CAPTION_LIMIT = 1024
-SHORT_DESCRIPTION_LIMIT = 300
-DESCRIPTION_CHUNK_LIMIT = 3900
-DESCRIPTION_CACHE_TTL = 3600
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
 COOKIE_DIR = DL_DIR / "cookies"
@@ -109,7 +98,6 @@ EMOJI = {"tiktok": "🎵", "instagram": "📷", "twitter": "𝕏", "youtube": "�
 
 session: aiohttp.ClientSession = None
 busy = set()
-description_cache = {}
 
 
 async def get_session():
@@ -352,7 +340,7 @@ async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
     d.add_field("video", open(path, "rb"), filename="video.mp4", content_type="video/mp4")
-    d.add_field("caption", caption[:TG_CAPTION_LIMIT])
+    d.add_field("caption", caption[:1024])
     d.add_field("supports_streaming", "true")
     if reply:
         d.add_field("reply_to_message_id", str(reply))
@@ -381,7 +369,7 @@ async def send_audio(chat, path, caption, reply):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
     d.add_field("audio", open(path, "rb"), filename=filename, content_type=ct)
-    d.add_field("caption", caption[:TG_CAPTION_LIMIT])
+    d.add_field("caption", caption[:1024])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
     return await tg("sendAudio", d, 60)
@@ -392,7 +380,7 @@ async def send_photo(chat, path, caption, reply):
     d.add_field("chat_id", str(chat))
     d.add_field("photo", open(path, "rb"), filename="photo.jpg", content_type="image/jpeg")
     if caption:
-        d.add_field("caption", caption[:TG_CAPTION_LIMIT])
+        d.add_field("caption", caption[:1024])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
     return await tg("sendPhoto", d, 60)
@@ -409,7 +397,7 @@ async def send_media_group(chat, paths, caption, reply):
         d.add_field(key, open(p, "rb"), filename=f"{key}.jpg", content_type="image/jpeg")
         entry = {"type": "photo", "media": f"attach://{key}"}
         if i == 0 and caption:
-            entry["caption"] = caption[:TG_CAPTION_LIMIT]
+            entry["caption"] = caption[:1024]
         media.append(entry)
     d.add_field("media", json.dumps(media))
     return await tg("sendMediaGroup", d, 120)
@@ -733,19 +721,6 @@ async def has_video_stream(path):
         return True  # assume video on error, preserve old behaviour
 
 
-async def _has_video_stream_strict(path):
-    try:
-        p = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
-            "-show_entries", "stream=codec_type", "-of", "json", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _ = await asyncio.wait_for(p.communicate(), 10)
-        data = json.loads(out)
-        return len(data.get("streams", [])) > 0
-    except Exception:
-        return False
-
-
 # ── download with yt-dlp as Python library ──
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -841,47 +816,6 @@ def _ext_from_url(url, default_ext):
     return default_ext
 
 
-def _ext_from_content_type(content_type, default_ext):
-    content_type = (content_type or "").split(";")[0].strip().lower()
-    return {
-        "image/jpeg": ".jpg",
-        "image/jpg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-        "video/mp4": ".mp4",
-        "video/webm": ".webm",
-        "audio/mpeg": ".mp3",
-        "audio/mp4": ".m4a",
-        "audio/ogg": ".ogg",
-        "audio/webm": ".webm",
-    }.get(content_type, default_ext)
-
-
-def _ext_from_cobalt(filename, media_url, content_type, default_ext):
-    ext = Path(filename or "").suffix.lower()
-    if ext and len(ext) <= 6:
-        return ext
-    ext = _ext_from_content_type(content_type, "")
-    if ext:
-        return ext
-    return _ext_from_url(media_url, default_ext)
-
-
-def _looks_like_image(path):
-    try:
-        with open(path, "rb") as f:
-            header = f.read(16)
-    except Exception:
-        return False
-    return (
-        header.startswith(b"\xff\xd8\xff")
-        or header.startswith(b"\x89PNG\r\n\x1a\n")
-        or header.startswith((b"GIF87a", b"GIF89a"))
-        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
-    )
-
-
 async def _download_url(url, path, headers=None, timeout=60):
     s = await get_session()
     async with s.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
@@ -935,285 +869,118 @@ def _description_from_info(info):
     return ""
 
 
-def _best_thumbnail_url(info):
-    direct_url = info.get("url")
-    if direct_url and (_ext_from_url(direct_url, "").lower() in IMAGE_EXT or "scontent" in direct_url):
-        return direct_url
-    thumbnails = info.get("thumbnails") or []
-    thumbnails = [t for t in thumbnails if t.get("url")]
-    if thumbnails:
-        best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
-        return best.get("url")
-    return info.get("thumbnail") or info.get("display_url") or info.get("thumbnail_url")
+async def _instagram_fast(url):
+    shortcode = _instagram_shortcode_from_url(url)
+    cookie = _cookie_header("instagram")
+    if not shortcode or not cookie:
+        return None, None
 
-
-def _collect_image_urls_from_info(info):
-    urls = []
-
-    def add(url):
-        if url and url not in urls:
-            urls.append(url)
-
-    def walk(item):
-        if not isinstance(item, dict):
-            return
-        entries = item.get("entries")
-        if entries:
-            for entry in entries:
-                walk(entry)
-            return
-        formats = item.get("formats") or []
-        has_video = any((f.get("vcodec") or "none") != "none" for f in formats)
-        if not has_video:
-            add(_best_thumbnail_url(item))
-
-    walk(info)
-    return urls
-
-
-async def _instagram_images_from_ytdlp(url):
     job = os.urandom(5).hex()
     out_dir = DL_DIR / job
     out_dir.mkdir(exist_ok=True)
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": False,
-        "ignore_no_formats_error": True,
-    }
-    cookie = COOKIES.get("instagram")
-    if cookie:
-        opts["cookiefile"] = cookie
 
-    loop = asyncio.get_event_loop()
-    try:
-        info = await loop.run_in_executor(None, lambda: _ytdlp_extract(url, opts, download=False))
-        image_urls = _collect_image_urls_from_info(info)[:20]
-        photo_paths = []
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.instagram.com/"}
-        for i, image_url in enumerate(image_urls):
-            path = out_dir / f"photo_{i}{_ext_from_url(image_url, '.jpg')}"
-            if await _download_url(image_url, str(path), headers=headers, timeout=30) and _looks_like_image(path):
-                photo_paths.append(str(path))
-            else:
-                path.unlink(missing_ok=True)
-
-        if not photo_paths:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
-
-        title = (info.get("title") or "Instagram")[:100]
-        description = _description_from_info(info)
-        log.info("[instagram/ytdlp-images] %d photos", len(photo_paths))
-        return {
-            "type": "photos",
-            "title": title,
-            "description": description,
-            "photo_paths": photo_paths,
-            "audio_path": None,
-            "dir": str(out_dir),
-        }, None
-    except Exception as e:
-        log.warning("[instagram/ytdlp-images] %s", e)
-        shutil.rmtree(out_dir, ignore_errors=True)
-        return None, None
-
-
-async def _download_cobalt_media(s, media_url, out_dir, stem, default_ext, filename=None, timeout=90):
-    tmp_path = out_dir / f"{stem}.tmp"
-    try:
-        async with s.get(media_url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            if r.status != 200:
-                return None
-            content_type = r.headers.get("Content-Type", "")
-            if content_type.split(";")[0].strip().lower() in {"application/json", "text/html", "text/plain"}:
-                return None
-            with open(tmp_path, "wb") as f:
-                async for chunk in r.content.iter_chunked(65536):
-                    f.write(chunk)
-
-        if not tmp_path.exists() or tmp_path.stat().st_size < 100:
-            tmp_path.unlink(missing_ok=True)
-            return None
-
-        ext = _ext_from_cobalt(filename, media_url, content_type, default_ext)
-        path = out_dir / f"{stem}{ext}"
-        tmp_path.replace(path)
-        return str(path)
-    except Exception as e:
-        log.warning("[instagram/cobalt] file download failed: %s", e)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return None
-
-
-async def _instagram_fast(url):
-    """Download Instagram via cobalt API without Instagram cookies."""
-    s = await get_session()
     headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
+        "User-Agent": "Instagram 219.0.0.12.117 Android",
+        "Accept": "*/*",
+        "X-IG-App-ID": "936619743392459",
+        "X-ASBD-ID": "198387",
+        "Origin": "https://www.instagram.com",
+        "Referer": url,
+        "Cookie": cookie,
     }
-    if COBALT_API_KEY:
-        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
-
-    payload = {
-        "url": url,
-        "videoQuality": "1080",
-        "filenameStyle": "basic",
-    }
-    out_dir = None
 
     try:
-        async with s.post(
-            COBALT_API_URL,
-            json=payload,
+        s = await get_session()
+        pk = _instagram_shortcode_to_pk(shortcode)
+        async with s.get(
+            f"https://i.instagram.com/api/v1/media/{pk}/info/",
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             if r.status != 200:
-                body = await r.text()
-                log.info("[instagram/cobalt] API HTTP %s: %s", r.status, body[:160])
+                shutil.rmtree(out_dir, ignore_errors=True)
                 return None, None
-            data = await r.json(content_type=None)
+            data = await r.json()
 
-        status = data.get("status")
-        if status == "error":
-            error = data.get("error") or {}
-            log.warning("[instagram/cobalt] error=%s", error.get("code") or error)
-            return None, None
-        if status not in ("tunnel", "redirect", "stream", "picker"):
-            log.info("[instagram/cobalt] unsupported status=%s", status)
-            return None, None
-
-        job = os.urandom(5).hex()
-        out_dir = DL_DIR / job
-        out_dir.mkdir(exist_ok=True)
-        title = "Instagram"
-
-        if status == "picker":
-            photo_paths = []
-            video_paths = []
-            for i, item in enumerate((data.get("picker") or [])[:10]):
-                item_url = item.get("url")
-                if not item_url:
-                    continue
-                item_type = item.get("type")
-                default_ext = ".jpg" if item_type in ("photo", "image") else ".mp4"
-                timeout = 30 if default_ext == ".jpg" else 90
-                path = await _download_cobalt_media(
-                    s, item_url, out_dir, f"item_{i}", default_ext, item.get("filename"), timeout=timeout
-                )
-                if not path:
-                    continue
-
-                suffix = Path(path).suffix.lower()
-                if await _has_video_stream_strict(path):
-                    video_paths.append(path)
-                    continue
-                if suffix in IMAGE_EXT or _looks_like_image(path):
-                    photo_paths.append(path)
-                    continue
-                Path(path).unlink(missing_ok=True)
-
-            audio_path = None
-            audio_url = data.get("audio")
-            if audio_url:
-                audio_path = await _download_cobalt_media(
-                    s, audio_url, out_dir, "audio", ".m4a", data.get("audioFilename"), timeout=60
-                )
-
-            if video_paths:
-                path = video_paths[0]
-                dur, w, h = await _ffprobe(path)
-                size = Path(path).stat().st_size
-                log.info("[instagram/cobalt] picker video OK: %d bytes, photos=%d", size, len(photo_paths))
-                return {
-                    "type": "video",
-                    "path": path,
-                    "title": title,
-                    "description": "",
-                    "duration": dur,
-                    "width": w,
-                    "height": h,
-                    "size": size,
-                    "dir": str(out_dir),
-                }, None
-
-            if photo_paths:
-                log.info("[instagram/cobalt] %d photos, audio=%s", len(photo_paths), bool(audio_path))
-                return {
-                    "type": "photos",
-                    "title": title,
-                    "description": "",
-                    "photo_paths": photo_paths,
-                    "audio_path": audio_path,
-                    "dir": str(out_dir),
-                }, None
-
+        item = (data.get("items") or [None])[0]
+        if not item:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, None
 
-        media_url = data.get("url")
-        if not media_url:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
+        user = item.get("user") or {}
+        username = user.get("username") or "instagram"
+        title = (item.get("title") or f"Instagram by {username}")[:100]
+        description = _instagram_description(item)
 
-        path = await _download_cobalt_media(
-            s, media_url, out_dir, job, ".mp4", data.get("filename"), timeout=90
-        )
-        if not path:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
+        media_items = item.get("carousel_media") or [item]
+        photo_paths = []
+        video_paths = []
 
-        suffix = Path(path).suffix.lower()
-        size = Path(path).stat().st_size
-        if suffix in IMAGE_EXT:
-            log.info("[instagram/cobalt] photo OK: %d bytes", size)
+        for i, media in enumerate(media_items):
+            media_type = media.get("media_type")
+            if media_type == 2:
+                video_url = _pick_instagram_video_url(media)
+                if not video_url:
+                    continue
+                video_path = out_dir / f"video_{i}{_ext_from_url(video_url, '.mp4')}"
+                if await _download_url(video_url, str(video_path), headers=headers):
+                    video_paths.append(str(video_path))
+                continue
+
+            image_url = _pick_instagram_image_url(media)
+            if not image_url:
+                continue
+            image_path = out_dir / f"photo_{i}{_ext_from_url(image_url, '.jpg')}"
+            if await _download_url(image_url, str(image_path), headers=headers, timeout=20):
+                photo_paths.append(str(image_path))
+
+        audio_path = None
+        audio_url = _instagram_audio_url(item)
+        if audio_url:
+            candidate = out_dir / f"audio{_ext_from_url(audio_url, '.m4a')}"
+            if await _download_url(audio_url, str(candidate), headers=headers, timeout=60):
+                audio_path = str(candidate)
+
+        if not audio_path and photo_paths and video_paths:
+            for video_path in video_paths:
+                if await has_audio_stream(video_path):
+                    candidate = str(out_dir / "audio.m4a")
+                    if await _extract_audio(video_path, candidate):
+                        audio_path = candidate
+                    break
+
+        if photo_paths:
+            log.info("[instagram/api] %d photos, audio=%s", len(photo_paths), bool(audio_path))
             return {
                 "type": "photos",
                 "title": title,
-                "description": "",
-                "photo_paths": [path],
-                "audio_path": None,
+                "description": description,
+                "photo_paths": photo_paths,
+                "audio_path": audio_path,
                 "dir": str(out_dir),
             }, None
 
-        if not await _has_video_stream_strict(path):
-            if await has_audio_stream(path):
-                log.info("[instagram/cobalt] audio OK: %d bytes", size)
-                return {
-                    "type": "audio",
-                    "path": path,
-                    "title": title,
-                    "description": "",
-                    "size": size,
-                    "dir": str(out_dir),
-                }, None
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, None
+        if video_paths:
+            path = video_paths[0]
+            dur, w, h = await _ffprobe(path)
+            return {
+                "type": "video",
+                "path": path,
+                "title": title,
+                "description": description,
+                "duration": dur,
+                "width": w,
+                "height": h,
+                "size": Path(path).stat().st_size,
+                "dir": str(out_dir),
+            }, None
 
-        dur, w, h = await _ffprobe(path)
-        log.info("[instagram/cobalt] video OK: %d bytes", size)
-        return {
-            "type": "video",
-            "path": path,
-            "title": title,
-            "description": "",
-            "duration": dur,
-            "width": w,
-            "height": h,
-            "size": size,
-            "dir": str(out_dir),
-        }, None
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, None
 
     except Exception as e:
-        log.warning("[instagram/cobalt] %s", e)
-        if out_dir:
-            shutil.rmtree(out_dir, ignore_errors=True)
+        log.warning("[instagram/api] %s", e)
+        shutil.rmtree(out_dir, ignore_errors=True)
         return None, None
 
 
@@ -1221,81 +988,15 @@ def make_caption(emoji, title, description="", extra=""):
     lines = [f"{emoji} {title}".strip()]
     if extra:
         lines.append(extra.strip())
-    base = "\n\n".join([line for line in lines if line])
-    description = (description or "").strip()
-    if not description or description in base or len(description) > SHORT_DESCRIPTION_LIMIT:
-        return base[:TG_CAPTION_LIMIT]
-
-    full = f"{base}\n\n{description}" if base else description
-    if len(full) <= TG_CAPTION_LIMIT:
-        return full
-    return base[:TG_CAPTION_LIMIT]
+    if description and description.strip() and description.strip() not in lines[0]:
+        lines.append(description.strip())
+    return "\n\n".join([line for line in lines if line])[:1024]
 
 
-def split_text(text, limit=DESCRIPTION_CHUNK_LIMIT):
-    text = (text or "").strip()
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = text.rfind(" ", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        chunk = text[:cut].strip()
-        if chunk:
-            yield chunk
-        text = text[cut:].strip()
-    if text:
-        yield text
-
-
-def cleanup_description_cache():
-    now = time.time()
-    expired = [
-        key for key, item in description_cache.items()
-        if now - item.get("created", now) > DESCRIPTION_CACHE_TTL
-    ]
-    for key in expired:
-        description_cache.pop(key, None)
-
-
-def store_description(description, control_text):
-    cleanup_description_cache()
-    key = os.urandom(5).hex()
-    description_cache[key] = {
-        "text": description,
-        "control_text": control_text,
-        "created": time.time(),
-        "message_ids": [],
-    }
-    return key
-
-
-def description_keyboard(key, shown=False):
-    text = "Hide description" if shown else "Show description"
-    return {
-        "inline_keyboard": [[
-            {"text": text, "callback_data": f"desc:{key}"},
-        ]]
-    }
-
-
-async def send_description_button_if_needed(chat, status_mid, emoji, result, caption, reply):
+async def send_description_if_needed(chat, emoji, result, caption, reply):
     description = (result.get("description") or "").strip()
-    if not description or description in caption or len(description) <= SHORT_DESCRIPTION_LIMIT:
-        return False
-
-    text = f"{emoji} Description is long ({len(description)} chars)"
-    key = store_description(description, text)
-    try:
-        if status_mid:
-            await edit_text(chat, status_mid, text, description_keyboard(key))
-        else:
-            await send_text(chat, text, reply, description_keyboard(key))
-        return True
-    except Exception as e:
-        description_cache.pop(key, None)
-        log.warning("[description] button failed: %s", e)
-        return False
+    if description and description not in caption:
+        await send_text(chat, f"{emoji} Description:\n{description[:3900]}", reply)
 
 
 async def download_media(url, platform):
@@ -1303,16 +1004,6 @@ async def download_media(url, platform):
         result, err = await _instagram_fast(url)
         if result:
             return result, None
-        log.info("[instagram] cobalt failed, falling back to yt-dlp")
-        result, err = await _ytdlp_download(url, platform)
-        if result:
-            return result, None
-        if err and "no video formats" in err.lower():
-            result, image_err = await _instagram_images_from_ytdlp(url)
-            if result:
-                return result, None
-            return None, image_err or err
-        return None, err
 
     if platform == "twitter":
         result, err = await _twitter_fast(url)
@@ -1509,10 +1200,10 @@ async def _ytdlp_download(url, platform):
         return None, err.split("\n")[-1][:200]
 
 
-def _ytdlp_extract(url, opts, download=True):
+def _ytdlp_extract(url, opts):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
+            return ydl.extract_info(url, download=True)
     except Exception as e:
         raise e
 
@@ -1642,33 +1333,6 @@ async def handle_callback(callback):
     if not chat or not mid:
         return
 
-    if data.startswith("desc:"):
-        cleanup_description_cache()
-        key = data.split(":", 1)[1]
-        item = description_cache.get(key)
-        if not item:
-            await edit_text(chat, mid, "Description expired")
-            asyncio.create_task(_del_later(chat, mid, 15))
-            return
-
-        if item.get("message_ids"):
-            for message_id in item["message_ids"]:
-                await delete_msg(chat, message_id)
-            item["message_ids"] = []
-            await edit_text(chat, mid, item.get("control_text", "Description is hidden"), description_keyboard(key))
-            return
-
-        message_ids = []
-        for i, chunk in enumerate(split_text(item["text"])):
-            prefix = "Description:\n" if i == 0 else ""
-            res = await send_text(chat, f"{prefix}{chunk}", mid)
-            sent_mid = res.get("result", {}).get("message_id")
-            if sent_mid:
-                message_ids.append(sent_mid)
-        item["message_ids"] = message_ids
-        await edit_text(chat, mid, f"Description shown ({len(item['text'])} chars)", description_keyboard(key, shown=True))
-        return
-
     if data == "proxy_check":
         await edit_text(chat, mid, "Checking proxies...", proxy_keyboard())
         text = await check_proxies_text()
@@ -1767,7 +1431,6 @@ async def handle(update):
                 continue
 
             try:
-                keep_status = False
                 if sid:
                     await edit_text(chat, sid, "⬆️ Uploading…")
 
@@ -1783,11 +1446,13 @@ async def handle(update):
                             await send_media_group(chat, chunk, chunk_caption, mid)
                     if result.get("audio_path"):
                         await send_audio(chat, result["audio_path"], make_caption(emoji, result["title"], extra="Audio"), mid)
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
                 # FIX: route audio-only results to sendAudio instead of sendVideo
                 elif result["type"] == "audio":
                     cap = make_caption(emoji, result["title"], result.get("description", ""), "audio only")
                     await send_audio(chat, result["path"], cap, mid)
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
                 else:
                     size_mb = result["size"] / 1048576
@@ -1800,10 +1465,9 @@ async def handle(update):
                     cap     = make_caption(emoji, result["title"], result.get("description", ""), f"{size_mb:.1f} MB{clip_note}")
                     await send_video(chat, result["path"], cap, mid,
                                      result["duration"], result["width"], result["height"])
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
 
-                keep_status = await send_description_button_if_needed(chat, sid, emoji, result, cap, mid)
-
-                if sid and not keep_status:
+                if sid:
                     await delete_msg(chat, sid)
 
             except Exception as e:
@@ -1848,10 +1512,10 @@ async def poll():
 
 
 async def cleanup():
+    import time
     while True:
         await asyncio.sleep(300)
         try:
-            cleanup_description_cache()
             for d in DL_DIR.iterdir():
                 if d.is_dir() and d.name != "cookies" and time.time() - d.stat().st_mtime > 300:
                     shutil.rmtree(d, ignore_errors=True)
