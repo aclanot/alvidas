@@ -1,7 +1,4 @@
-import subprocess, sys
-
-print("[start] Upgrading yt-dlp...", flush=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"], check=False)
+import asyncio
 
 try:
     import yt_dlp
@@ -10,5 +7,5 @@ except Exception:
     print("[start] yt-dlp: unknown version", flush=True)
 
 print("[start] Starting bot...", flush=True)
-import bot, asyncio
+import bot
 asyncio.run(bot.main())
