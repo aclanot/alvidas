@@ -21,6 +21,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_BASE64", "")
 PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
+ADMIN_CHAT_IDS_RAW = os.environ.get("ADMIN_CHAT_IDS") or os.environ.get("ADMIN_CHAT_ID", "")
 MAX_TG = 50 * 1024 * 1024
 DL_DIR = Path(tempfile.gettempdir()) / "downloads"
 DL_DIR.mkdir(exist_ok=True)
@@ -41,6 +42,9 @@ for entry in PROXY_LIST_RAW.split(","):
         PROXIES.append(entry)
 if PROXIES:
     log.info("Loaded %d proxies", len(PROXIES))
+ADMIN_CHAT_IDS = [chat_id.strip() for chat_id in ADMIN_CHAT_IDS_RAW.split(",") if chat_id.strip()]
+DISABLED_PROXIES = set()
+PROXY_LAST_ERROR = {}
 
 # ── cookies from base64 env vars ──
 COOKIE_ENV = {
@@ -108,9 +112,14 @@ async def get_session():
 
 
 def current_proxy():
-    if not PROXIES:
+    proxies = active_proxies()
+    if not proxies:
         return None
-    return random.choice(PROXIES)
+    return random.choice(proxies)
+
+
+def active_proxies():
+    return [proxy for proxy in PROXIES if proxy not in DISABLED_PROXIES]
 
 
 def current_http_proxy():
@@ -130,6 +139,10 @@ def mask_proxy(proxy):
     return re.sub(r"://[^:@]+:[^@]+@", "://***:***@", proxy)
 
 
+def sanitize_proxy_detail(detail):
+    return re.sub(r"://[^:@\s]+:[^@\s]+@", "://***:***@", str(detail))[:120]
+
+
 def proxy_keyboard():
     return {
         "inline_keyboard": [[
@@ -141,10 +154,14 @@ def proxy_keyboard():
 def proxy_status_text(prefix="Proxy settings"):
     if not PROXIES:
         return f"{prefix}\n\nNo proxies configured. Set PROXY_LIST in Railway to enable proxies."
+    active = len(active_proxies())
+    disabled = len(DISABLED_PROXIES)
     return (
         f"{prefix}\n\n"
         f"Configured: {len(PROXIES)}\n"
-        "Downloads use the configured proxies automatically."
+        f"Active: {active}\n"
+        f"Disabled: {disabled}\n"
+        "Downloads use active proxies automatically."
     )
 
 
@@ -163,17 +180,49 @@ async def check_one_proxy(proxy):
             elapsed = asyncio.get_event_loop().time() - started
             return True, data.get("ip", "ok"), elapsed
     except Exception as e:
-        return False, str(e).split("\n")[0][:80], None
+        return False, sanitize_proxy_detail(str(e).split("\n")[0]), None
 
 
 async def check_proxies_text():
     if not PROXIES:
         return proxy_status_text("Proxy check")
-    lines = [proxy_status_text("Proxy check"), ""]
     results = await asyncio.gather(*(check_one_proxy(proxy) for proxy in PROXIES))
+    newly_disabled = []
+    recovered = []
+
     for i, (proxy, result) in enumerate(zip(PROXIES, results), start=1):
         ok, detail, elapsed = result
-        status = "OK" if ok else "FAIL"
+        if ok:
+            PROXY_LAST_ERROR.pop(proxy, None)
+            if proxy in DISABLED_PROXIES:
+                DISABLED_PROXIES.discard(proxy)
+                recovered.append(proxy)
+        else:
+            PROXY_LAST_ERROR[proxy] = detail
+            if proxy not in DISABLED_PROXIES:
+                DISABLED_PROXIES.add(proxy)
+                newly_disabled.append((proxy, detail))
+
+    if newly_disabled:
+        lines = ["Proxy alert: disabled failed proxies", ""]
+        for proxy, detail in newly_disabled:
+            lines.append(f"- {mask_proxy(proxy)} - {detail}")
+        lines.append("")
+        lines.append(f"Active: {len(active_proxies())}/{len(PROXIES)}")
+        await alert_admins("\n".join(lines)[:3900])
+
+    if recovered:
+        lines = ["Proxy alert: recovered proxies", ""]
+        for proxy in recovered:
+            lines.append(f"- {mask_proxy(proxy)}")
+        lines.append("")
+        lines.append(f"Active: {len(active_proxies())}/{len(PROXIES)}")
+        await alert_admins("\n".join(lines)[:3900])
+
+    lines = [proxy_status_text("Proxy check"), ""]
+    for i, (proxy, result) in enumerate(zip(PROXIES, results), start=1):
+        ok, detail, elapsed = result
+        status = "OK" if ok else "DISABLED"
         timing = f" {elapsed:.1f}s" if elapsed is not None else ""
         lines.append(f"{i}. {status} - {mask_proxy(proxy)} - {detail}{timing}")
     return "\n".join(lines)[:3900]
@@ -197,6 +246,8 @@ def bot_status_text():
         "Bot status\n\n"
         f"Busy downloads: {len(busy)}\n"
         f"Proxies configured: {len(PROXIES)}\n"
+        f"Proxies active: {len(active_proxies())}\n"
+        f"Proxies disabled: {len(DISABLED_PROXIES)}\n"
         f"Cookies loaded: {', '.join(sorted(COOKIES)) if COOKIES else 'none'}"
     )
 
@@ -306,6 +357,16 @@ async def send_text(chat, text, reply=None, reply_markup=None):
     if reply_markup:
         d.add_field("reply_markup", json.dumps(reply_markup))
     return await tg("sendMessage", d, 30)
+
+
+async def alert_admins(text):
+    if not ADMIN_CHAT_IDS:
+        return
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            await send_text(chat_id, text)
+        except Exception as e:
+            log.warning("[admin-alert] %s", e)
 
 
 async def edit_text(chat, mid, text, reply_markup=None):
@@ -1087,8 +1148,9 @@ async def _ytdlp_download(url, platform):
     if cookie:
         opts["cookiefile"] = cookie
 
-    if platform not in ("instagram", "youtube") and current_proxy():
-        opts["proxy"] = current_proxy()
+    proxy = current_proxy() if platform not in ("instagram", "youtube") else None
+    if proxy:
+        opts["proxy"] = proxy
 
     if platform == "twitter":
         opts["extractor_args"] = {"twitter": ["api=syndication"]}
