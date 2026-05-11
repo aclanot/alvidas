@@ -8,7 +8,7 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
 import yt_dlp
@@ -28,6 +28,11 @@ DL_DIR.mkdir(exist_ok=True)
 COOKIE_DIR = DL_DIR / "cookies"
 COOKIE_DIR.mkdir(exist_ok=True)
 COOKIES = {}
+MAX_PARALLEL_DOWNLOADS = max(1, int(os.environ.get("MAX_PARALLEL_DOWNLOADS", "3")))
+MAX_PARALLEL_UPLOADS = max(1, int(os.environ.get("MAX_PARALLEL_UPLOADS", "2")))
+MAX_PARALLEL_FFMPEG = max(1, int(os.environ.get("MAX_PARALLEL_FFMPEG", "1")))
+MAX_LINKS_PER_MESSAGE = max(1, int(os.environ.get("MAX_LINKS_PER_MESSAGE", "20")))
+
 
 # ── proxies ──
 PROXIES = []
@@ -89,19 +94,26 @@ for platform, b64 in COOKIE_ENV.items():
 
 # ── URL patterns ──
 PATTERNS = {
-    "tiktok":    [r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+"],
-    "instagram": [r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv|stories)/[\w.-]+(?:/[\w.-]+)?"],
-    "twitter":   [r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+"],
-    "youtube":   [
-        r"https?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)[\w-]+",
-        r"https?://youtu\.be/[\w-]+",
-        r"https?://music\.youtube\.com/watch\?v=[\w-]+",
+    "tiktok": [r"https?://(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/\S+"],
+    "instagram": [r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv|stories|share)/(?:[\w.-]+/?){1,3}(?:\?\S*)?"],
+    "twitter": [
+        r"https?://(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/\w+/status/\d+(?:\?\S*)?",
+        r"https?://(?:www\.)?x\.com/i/status/\d+(?:\?\S*)?",
+    ],
+    "youtube": [
+        r"https?://(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[\w-]+[^\s]*",
+        r"https?://(?:www\.|m\.)?youtube\.com/(?:shorts|embed|live)/[\w-]+(?:\?\S*)?",
+        r"https?://youtu\.be/[\w-]+(?:\?\S*)?",
+        r"https?://music\.youtube\.com/watch\?[^\s]*v=[\w-]+[^\s]*",
     ],
 }
 EMOJI = {"tiktok": "🎵", "instagram": "📷", "twitter": "𝕏", "youtube": "▶️"}
 
 session: aiohttp.ClientSession = None
 busy = set()
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
+FFMPEG_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_FFMPEG)
 
 
 async def get_session():
@@ -244,7 +256,11 @@ def bot_help_text():
 def bot_status_text():
     return (
         "Bot status\n\n"
-        f"Busy downloads: {len(busy)}\n"
+        f"Busy requests: {len(busy)}\n"
+        f"Download slots: {MAX_PARALLEL_DOWNLOADS}\n"
+        f"Upload slots: {MAX_PARALLEL_UPLOADS}\n"
+        f"FFmpeg slots: {MAX_PARALLEL_FFMPEG}\n"
+        f"Links per message: {MAX_LINKS_PER_MESSAGE}\n"
         f"Proxies configured: {len(PROXIES)}\n"
         f"Proxies active: {len(active_proxies())}\n"
         f"Proxies disabled: {len(DISABLED_PROXIES)}\n"
@@ -252,16 +268,58 @@ def bot_status_text():
     )
 
 
+def normalize_url(platform, url):
+    url = url.rstrip('.,;!?) ]')
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = re.sub(r"/{2,}", "/", parsed.path)
+
+    if platform == "twitter":
+        m = re.search(r"/(\w+)/status/(\d+)", path)
+        if m:
+            return f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+        m = re.search(r"/i/status/(\d+)", path)
+        if m:
+            return f"https://x.com/i/status/{m.group(1)}"
+
+    if platform == "instagram":
+        keep = {}
+        params = parse_qs(parsed.query)
+        if "img_index" in params:
+            keep["img_index"] = params["img_index"][0]
+        return urlunparse((parsed.scheme or "https", host or "www.instagram.com", path.rstrip("/") + "/", "", urlencode(keep), ""))
+
+    if platform == "youtube":
+        params = parse_qs(parsed.query)
+        keep = {}
+        if "v" in params:
+            keep["v"] = params["v"][0]
+        if "t" in params:
+            keep["t"] = params["t"][0]
+        if "start" in params and "t" not in keep:
+            keep["t"] = params["start"][0]
+        query = urlencode(keep)
+        return urlunparse((parsed.scheme or "https", host, path, "", query, ""))
+
+    if platform == "tiktok":
+        return urlunparse((parsed.scheme or "https", host, path.rstrip("/"), "", "", ""))
+
+    return url
+
+
 def find_urls(text):
-    found = []
+    matches = []
+    seen = set()
     for platform, pats in PATTERNS.items():
         for pat in pats:
             for m in re.finditer(pat, text, re.IGNORECASE):
-                url = m.group(0)
-                if url not in [u for _, u in found]:
-                    found.append((platform, url))
-    return found
-
+                url = normalize_url(platform, m.group(0))
+                if url in seen:
+                    continue
+                seen.add(url)
+                matches.append((m.start(), platform, url))
+    matches.sort(key=lambda item: item[0])
+    return [(platform, url) for _, platform, url in matches]
 
 def _parse_timecode_to_seconds(value):
     parts = value.split(":")
@@ -341,11 +399,41 @@ def extract_clip_request(text, url):
 
 async def tg(method, data, timeout=120):
     s = await get_session()
-    async with s.post(f"{API}/{method}", data=data, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-        res = await r.json()
-        if not res.get("ok"):
-            raise Exception(res.get("description", method))
-        return res
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with s.post(f"{API}/{method}", data=data, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                try:
+                    res = await r.json()
+                except Exception:
+                    body = await r.text()
+                    res = {"ok": False, "description": body[:300], "error_code": r.status}
+
+                if res.get("ok"):
+                    return res
+
+                error_code = res.get("error_code") or r.status
+                description = res.get("description", method)
+                retry_after = (res.get("parameters") or {}).get("retry_after")
+                can_retry_body = not getattr(data, "_is_multipart", False)
+                if can_retry_body and error_code == 429 and retry_after and attempt < 2:
+                    wait = int(retry_after) + 1
+                    log.warning("[telegram] %s flood-wait %ss", method, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                if can_retry_body and error_code >= 500 and attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise Exception(description)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = e
+            can_retry_body = not getattr(data, "_is_multipart", False)
+            if can_retry_body and attempt < 2:
+                log.warning("[telegram] %s retry %d: %s", method, attempt + 1, e)
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise Exception(str(last_error) if last_error else method)
 
 
 async def send_text(chat, text, reply=None, reply_markup=None):
@@ -400,7 +488,6 @@ async def delete_msg(chat, mid):
 async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
-    d.add_field("video", open(path, "rb"), filename="video.mp4", content_type="video/mp4")
     d.add_field("caption", caption[:1024])
     d.add_field("supports_streaming", "true")
     if reply:
@@ -411,57 +498,92 @@ async def send_video(chat, path, caption, reply, dur=0, w=0, h=0):
         d.add_field("width", str(w))
     if h:
         d.add_field("height", str(h))
-    return await tg("sendVideo", d, 180)
+    try:
+        with open(path, "rb") as f:
+            d.add_field("video", f, filename="video.mp4", content_type="video/mp4")
+            return await tg("sendVideo", d, 180)
+    except Exception:
+        log.exception("[upload] sendVideo failed for %s", path)
+        raise
 
 
-# FIX: use real file extension and correct content-type instead of always audio/mpeg
 async def send_audio(chat, path, caption, reply):
     ext = Path(path).suffix.lower() or ".ogg"
-    _CT = {
-        ".mp3":  "audio/mpeg",
-        ".mp4":  "audio/mp4",
-        ".m4a":  "audio/mp4",
-        ".ogg":  "audio/ogg",
-        ".opus": "audio/ogg",
-        ".webm": "audio/webm",
+    content_types = {
+        ".mp3": "audio/mpeg", ".mp4": "audio/mp4", ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg", ".opus": "audio/ogg", ".webm": "audio/webm",
     }
-    ct = _CT.get(ext, "audio/octet-stream")
-    filename = f"audio{ext}"
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
-    d.add_field("audio", open(path, "rb"), filename=filename, content_type=ct)
     d.add_field("caption", caption[:1024])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
-    return await tg("sendAudio", d, 60)
+    try:
+        with open(path, "rb") as f:
+            d.add_field("audio", f, filename=f"audio{ext}", content_type=content_types.get(ext, "audio/octet-stream"))
+            return await tg("sendAudio", d, 60)
+    except Exception:
+        log.exception("[upload] sendAudio failed for %s", path)
+        raise
 
 
 async def send_photo(chat, path, caption, reply):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
-    d.add_field("photo", open(path, "rb"), filename="photo.jpg", content_type="image/jpeg")
     if caption:
         d.add_field("caption", caption[:1024])
     if reply:
         d.add_field("reply_to_message_id", str(reply))
-    return await tg("sendPhoto", d, 60)
+    try:
+        with open(path, "rb") as f:
+            d.add_field("photo", f, filename="photo.jpg", content_type="image/jpeg")
+            return await tg("sendPhoto", d, 60)
+    except Exception:
+        log.exception("[upload] sendPhoto failed for %s", path)
+        raise
 
 
-async def send_media_group(chat, paths, caption, reply):
+def _media_entry(item):
+    if isinstance(item, dict):
+        return item
+    return {"type": "photo", "path": item}
+
+
+async def send_media_group(chat, media_items, caption, reply):
     d = aiohttp.FormData()
     d.add_field("chat_id", str(chat))
     if reply:
         d.add_field("reply_to_message_id", str(reply))
     media = []
-    for i, p in enumerate(paths[:10]):
-        key = f"photo{i}"
-        d.add_field(key, open(p, "rb"), filename=f"{key}.jpg", content_type="image/jpeg")
-        entry = {"type": "photo", "media": f"attach://{key}"}
-        if i == 0 and caption:
-            entry["caption"] = caption[:1024]
-        media.append(entry)
-    d.add_field("media", json.dumps(media))
-    return await tg("sendMediaGroup", d, 120)
+    opened = []
+    try:
+        for i, raw in enumerate(media_items[:10]):
+            item = _media_entry(raw)
+            media_type = item.get("type", "photo")
+            path = item["path"]
+            key = f"{media_type}{i}"
+            f = open(path, "rb")
+            opened.append(f)
+            if media_type == "video":
+                d.add_field(key, f, filename=f"{key}.mp4", content_type="video/mp4")
+                entry = {"type": "video", "media": f"attach://{key}", "supports_streaming": True}
+            else:
+                d.add_field(key, f, filename=f"{key}.jpg", content_type="image/jpeg")
+                entry = {"type": "photo", "media": f"attach://{key}"}
+            if i == 0 and caption:
+                entry["caption"] = caption[:1024]
+            media.append(entry)
+        d.add_field("media", json.dumps(media))
+        return await tg("sendMediaGroup", d, 120)
+    except Exception:
+        log.exception("[upload] sendMediaGroup failed for %s", [(_media_entry(i).get("path")) for i in media_items[:10]])
+        raise
+    finally:
+        for f in opened:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 # ── fast paths: direct API downloads ──
@@ -514,7 +636,7 @@ async def _twitter_fast(url):
     proxy = current_http_proxy()
     try:
         async with s.get(f"https://api.fxtwitter.com/{username}/status/{tweet_id}",
-                         headers={"User-Agent": "BotikDodik/1.0"},
+                         headers={"User-Agent": "AlvidasBot/1.0"},
                          proxy=proxy,
                          timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
@@ -748,9 +870,10 @@ async def _reencode_h264(input_path, output_path):
                "-c:a", "aac", "-b:a", "128k",
                "-movflags", "+faststart", "-pix_fmt", "yuv420p",
                output_path]
-        p = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await asyncio.wait_for(p.communicate(), 120)
+        async with FFMPEG_SEMAPHORE:
+            p = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _, stderr = await asyncio.wait_for(p.communicate(), 120)
         if p.returncode != 0:
             log.error("[reencode] ffmpeg error: %s", stderr.decode()[:300] if stderr else "")
             return False
@@ -794,10 +917,11 @@ async def cut_video_clip(input_path, output_path, start_sec, duration_sec):
             "-pix_fmt", "yuv420p",
             output_path,
         ]
-        p = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await asyncio.wait_for(p.communicate(), 180)
+        async with FFMPEG_SEMAPHORE:
+            p = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(p.communicate(), 180)
         if p.returncode != 0:
             log.error("[clip] ffmpeg failed: %s", stderr.decode()[:300] if stderr else "")
             return False
@@ -943,11 +1067,12 @@ async def has_audio_stream(path):
 
 async def _extract_audio(input_path, output_path):
     try:
-        p = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", input_path, "-vn",
-            "-c:a", "aac", "-b:a", "128k", output_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await asyncio.wait_for(p.communicate(), 120)
+        async with FFMPEG_SEMAPHORE:
+            p = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", input_path, "-vn",
+                "-c:a", "aac", "-b:a", "128k", output_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _, stderr = await asyncio.wait_for(p.communicate(), 120)
         if p.returncode != 0:
             log.warning("[audio] extract failed: %s", stderr.decode(errors="ignore")[:300] if stderr else "")
             return False
@@ -1014,6 +1139,7 @@ async def _instagram_fast(url):
         description = _instagram_description(item)
 
         media_items = item.get("carousel_media") or [item]
+        media_paths = []
         photo_paths = []
         video_paths = []
 
@@ -1025,7 +1151,10 @@ async def _instagram_fast(url):
                     continue
                 video_path = out_dir / f"video_{i}{_ext_from_url(video_url, '.mp4')}"
                 if await _download_url(video_url, str(video_path), headers=headers):
-                    video_paths.append(str(video_path))
+                    path = str(video_path)
+                    video_paths.append(path)
+                    dur, w, h = await _ffprobe(path)
+                    media_paths.append({"type": "video", "path": path, "duration": dur, "width": w, "height": h})
                 continue
 
             image_url = _pick_instagram_image_url(media)
@@ -1033,7 +1162,9 @@ async def _instagram_fast(url):
                 continue
             image_path = out_dir / f"photo_{i}{_ext_from_url(image_url, '.jpg')}"
             if await _download_url(image_url, str(image_path), headers=headers, timeout=20):
-                photo_paths.append(str(image_path))
+                path = str(image_path)
+                photo_paths.append(path)
+                media_paths.append({"type": "photo", "path": path})
 
         audio_path = None
         audio_url = _instagram_audio_url(item)
@@ -1049,6 +1180,17 @@ async def _instagram_fast(url):
                     if await _extract_audio(video_path, candidate):
                         audio_path = candidate
                     break
+
+        if photo_paths and video_paths:
+            log.info("[instagram/api] %d mixed items, audio=%s", len(media_paths), bool(audio_path))
+            return {
+                "type": "media",
+                "title": title,
+                "description": description,
+                "media": media_paths,
+                "audio_path": audio_path,
+                "dir": str(out_dir),
+            }, None
 
         if photo_paths:
             log.info("[instagram/api] %d photos, audio=%s", len(photo_paths), bool(audio_path))
@@ -1085,38 +1227,97 @@ async def _instagram_fast(url):
         return None, None
 
 
+MAX_TELEGRAM_CAPTION = 1024
+MAX_TELEGRAM_TEXT = 4096
+
+
 def make_caption(emoji, title, description="", extra=""):
     lines = [f"{emoji} {title}".strip()]
     if extra:
         lines.append(extra.strip())
-    if description and description.strip() and description.strip() not in lines[0]:
-        lines.append(description.strip())
-    return "\n\n".join([line for line in lines if line])[:1024]
+
+    description = (description or "").strip()
+    if description and description not in lines[0]:
+        candidate = "\n\n".join([*lines, description])
+        if len(candidate) <= MAX_TELEGRAM_CAPTION:
+            lines.append(description)
+
+    return "\n\n".join([line for line in lines if line])[:MAX_TELEGRAM_CAPTION]
 
 
 async def send_description_if_needed(chat, emoji, result, caption, reply):
     description = (result.get("description") or "").strip()
-    if description and description not in caption:
-        await send_text(chat, f"{emoji} Description:\n{description[:3900]}", reply)
+    if not description:
+        return
+
+    # If the full description fit into the media caption, do not send it again.
+    # Long descriptions are intentionally omitted from captions and sent once as text.
+    if description in caption:
+        return
+
+    await send_text(chat, f"{emoji} Description:\n{description[:MAX_TELEGRAM_TEXT - 32]}", reply)
+
+
+def _result_files(result):
+    if not result:
+        return []
+    files = []
+    if result.get("path"):
+        files.append(result["path"])
+    files.extend(result.get("photo_paths") or [])
+    files.extend(item.get("path") for item in result.get("media") or [] if item.get("path"))
+    if result.get("audio_path"):
+        files.append(result["audio_path"])
+    return files
+
+
+def validate_result_size(result):
+    for file_path in _result_files(result):
+        try:
+            size = Path(file_path).stat().st_size
+        except FileNotFoundError:
+            return f"Downloaded file missing: {Path(file_path).name}"
+        if size > MAX_TG:
+            return f"Too large for Telegram bot upload ({size // 1048576} MB, limit 50 MB)"
+    return None
+
+
+async def _validated(result, err):
+    if result:
+        size_err = validate_result_size(result)
+        if size_err:
+            shutil.rmtree(result.get("dir", ""), ignore_errors=True)
+            return None, size_err
+    return result, err
 
 
 async def download_media(url, platform):
     if platform == "instagram":
         result, err = await _instagram_fast(url)
         if result:
-            return result, None
+            return await _validated(result, None)
 
     if platform == "twitter":
         result, err = await _twitter_fast(url)
         if result:
-            return result, None
+            return await _validated(result, None)
 
     if platform == "tiktok":
         result, err = await _tiktok_fast(url)
         if result:
-            return result, None
+            return await _validated(result, None)
 
-    return await _ytdlp_download(url, platform)
+    result, err = await _ytdlp_download(url, platform)
+    if result:
+        return await _validated(result, None)
+
+    if platform == "youtube":
+        piped_result, piped_err = await piped_download(url)
+        if piped_result:
+            return await _validated(piped_result, None)
+        return None, err or piped_err
+
+    return None, err
 
 
 async def _ytdlp_download(url, platform):
@@ -1310,7 +1511,7 @@ def _ytdlp_extract(url, opts):
         raise e
 
 
-# ── cobalt fallback for YouTube ──
+# ── Piped fallback for YouTube ──
 
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
@@ -1325,8 +1526,68 @@ PIPED_INSTANCES = [
 
 
 def _extract_video_id(url):
-    m = re.search(r"(?:v=|shorts/|youtu\.be/)([\w-]{11})", url)
+    m = re.search(r"(?:v=|shorts/|embed/|live/|youtu\.be/)([\w-]{11})", url)
     return m.group(1) if m else None
+
+
+async def _download_stream_to_file(url, path, timeout=120):
+    s = await get_session()
+    async with s.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+        if r.status != 200:
+            return f"HTTP {r.status}"
+        with open(path, "wb") as f:
+            async for chunk in r.content.iter_chunked(65536):
+                f.write(chunk)
+    return None
+
+
+def _pick_piped_progressive(streams):
+    best = None
+    for stream in streams:
+        if stream.get("videoOnly", True) or not stream.get("url"):
+            continue
+        h = stream.get("height") or 0
+        if h and h > 720:
+            continue
+        if best is None or h > (best.get("height") or 0):
+            best = stream
+    return best
+
+
+def _pick_piped_video_only(streams):
+    best = None
+    for stream in streams:
+        if not stream.get("videoOnly") or not stream.get("url"):
+            continue
+        h = stream.get("height") or 0
+        if h and h > 720:
+            continue
+        if best is None or h > (best.get("height") or 0):
+            best = stream
+    return best
+
+
+def _pick_piped_audio(streams):
+    best = None
+    for stream in streams:
+        if not stream.get("url"):
+            continue
+        bitrate = stream.get("bitrate") or stream.get("quality") or 0
+        if best is None or bitrate > (best.get("bitrate") or best.get("quality") or 0):
+            best = stream
+    return best
+
+
+async def _ffmpeg_copy(input_args, output_path, timeout=240):
+    cmd = ["ffmpeg", "-y", *input_args, "-c", "copy", "-movflags", "+faststart", output_path]
+    async with FFMPEG_SEMAPHORE:
+        p = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(p.communicate(), timeout)
+    if p.returncode != 0:
+        return stderr.decode(errors="ignore")[:300] if stderr else "ffmpeg failed"
+    return None
 
 
 async def piped_download(url):
@@ -1349,7 +1610,7 @@ async def piped_download(url):
                     if r.status != 200:
                         continue
                     stream_data = await r.json()
-                    if stream_data.get("videoStreams"):
+                    if stream_data.get("videoStreams") or stream_data.get("hls"):
                         log.info("[piped] using %s", instance)
                         break
                     stream_data = None
@@ -1361,57 +1622,68 @@ async def piped_download(url):
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "All Piped instances failed"
 
-        title    = stream_data.get("title", "Video")[:100]
+        title = stream_data.get("title", "Video")[:100]
         duration = stream_data.get("duration", 0)
+        video_streams = stream_data.get("videoStreams") or []
+        audio_streams = stream_data.get("audioStreams") or []
 
-        best_url = None
+        progressive = _pick_piped_progressive(video_streams)
         best_w = best_h = 0
-        for vs in stream_data.get("videoStreams", []):
-            if not vs.get("videoOnly", True) and vs.get("url"):
-                h = vs.get("height", 0)
-                if h <= 720 and h > best_h:
-                    best_url = vs["url"]
-                    best_w   = vs.get("width", 0)
-                    best_h   = h
-
-        if not best_url:
-            for vs in stream_data.get("videoStreams", []):
-                if vs.get("url"):
-                    h = vs.get("height", 0)
-                    if h <= 720 and h > best_h:
-                        best_url = vs["url"]
-                        best_w   = vs.get("width", 0)
-                        best_h   = h
-
-        if not best_url:
-            hls = stream_data.get("hls")
-            if hls:
-                best_url = hls
-
-        if not best_url:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return None, "No suitable stream found"
-
-        async with s.get(best_url, timeout=aiohttp.ClientTimeout(total=120)) as r:
-            if r.status != 200:
+        if progressive:
+            err = await _download_stream_to_file(progressive["url"], path)
+            if err:
                 shutil.rmtree(out_dir, ignore_errors=True)
-                return None, f"Piped stream HTTP {r.status}"
-            with open(path, "wb") as f:
-                async for chunk in r.content.iter_chunked(65536):
-                    f.write(chunk)
+                return None, f"Piped stream {err}"
+            best_w = progressive.get("width") or 0
+            best_h = progressive.get("height") or 0
+        else:
+            video_only = _pick_piped_video_only(video_streams)
+            audio = _pick_piped_audio(audio_streams)
+            if video_only and audio:
+                video_path = str(out_dir / "video_only.mp4")
+                audio_path = str(out_dir / "audio_only.m4a")
+                err = await _download_stream_to_file(video_only["url"], video_path)
+                if err:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, f"Piped video stream {err}"
+                err = await _download_stream_to_file(audio["url"], audio_path)
+                if err:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, f"Piped audio stream {err}"
+                err = await _ffmpeg_copy(["-i", video_path, "-i", audio_path], path)
+                if err:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, f"Piped merge failed: {err}"
+                best_w = video_only.get("width") or 0
+                best_h = video_only.get("height") or 0
+            elif stream_data.get("hls"):
+                err = await _ffmpeg_copy(["-i", stream_data["hls"]], path, timeout=300)
+                if err:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    return None, f"HLS conversion failed: {err}"
+            else:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, "No playable Piped stream with audio found"
 
-        size = os.path.getsize(path)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
         if size < 1000:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, "Piped empty file"
         if size > MAX_TG:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None, f"Too large ({size // 1048576} MB, limit 50 MB)"
+        if not await has_video_stream(path):
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "Piped result has no video stream"
+        if not await has_audio_stream(path):
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return None, "Piped result has no audio stream"
 
+        dur, probed_w, probed_h = await _ffprobe(path)
         log.info("[piped] OK: %s (%d bytes)", title, size)
         return {
             "type": "video", "path": path, "title": title,
-            "duration": duration, "width": best_w, "height": best_h,
+            "duration": dur or duration, "width": probed_w or best_w, "height": probed_h or best_h,
             "size": size, "dir": str(out_dir),
         }, None
 
@@ -1444,15 +1716,151 @@ async def handle_callback(callback):
     await edit_text(chat, mid, bot_status_text(), proxy_keyboard())
 
 
+async def _send_photo_collection(chat, result, caption, reply):
+    paths = result["photo_paths"]
+    for offset in range(0, len(paths), 10):
+        chunk = paths[offset:offset + 10]
+        chunk_caption = caption if offset == 0 else ""
+        if len(chunk) == 1:
+            await send_photo(chat, chunk[0], chunk_caption, reply)
+        else:
+            await send_media_group(chat, chunk, chunk_caption, reply)
+
+
+async def _send_mixed_media(chat, result, caption, reply):
+    media = result.get("media") or []
+    for offset in range(0, len(media), 10):
+        chunk = media[offset:offset + 10]
+        chunk_caption = caption if offset == 0 else ""
+        if len(chunk) == 1:
+            item = chunk[0]
+            if item.get("type") == "video":
+                await send_video(
+                    chat, item["path"], chunk_caption, reply,
+                    item.get("duration", 0), item.get("width", 0), item.get("height", 0),
+                )
+            else:
+                await send_photo(chat, item["path"], chunk_caption, reply)
+        else:
+            await send_media_group(chat, chunk, chunk_caption, reply)
+
+
+async def process_url(chat, mid, text, platform, url):
+    key = (chat, url)
+    if key in busy:
+        await send_text(chat, "Already downloading this link for this chat…", mid)
+        return
+
+    busy.add(key)
+    result = None
+    sid = None
+    try:
+        emoji = EMOJI.get(platform, "🎬")
+        res = await send_text(chat, f"{emoji} Downloading…", mid)
+        sid = res.get("result", {}).get("message_id")
+
+        log.info("[%s] waiting for download slot: %s", platform, url)
+        async with DOWNLOAD_SEMAPHORE:
+            log.info("[%s] download started: %s", platform, url)
+            result, err = await download_media(url, platform)
+
+        clip_request = None
+        if platform == "youtube":
+            clip_request = extract_clip_request(text, url)
+            if clip_request and result and result.get("type") == "video":
+                clip_path = str(Path(result["dir"]) / "clip.mp4")
+                ok = await cut_video_clip(
+                    result["path"],
+                    clip_path,
+                    clip_request["start"],
+                    clip_request["duration"],
+                )
+                if ok:
+                    try:
+                        os.remove(result["path"])
+                    except Exception:
+                        pass
+                    dur, w, h = await _ffprobe(clip_path)
+                    result["path"] = clip_path
+                    result["size"] = Path(clip_path).stat().st_size
+                    result["duration"] = dur
+                    result["width"] = w or result.get("width", 0)
+                    result["height"] = h or result.get("height", 0)
+                    size_err = validate_result_size(result)
+                    if size_err:
+                        err = size_err
+                else:
+                    err = "Could not cut requested clip"
+
+        if err and platform == "youtube" and "sign in" in err.lower():
+            err = "YouTube blocked this server. Set YOUTUBE_COOKIES_BASE64 env var."
+
+        if err:
+            if sid:
+                await edit_text(chat, sid, f"❌ {err[:300]}")
+            asyncio.create_task(_del_later(chat, sid, 15))
+            return
+
+        try:
+            if sid:
+                await edit_text(chat, sid, "⬆️ Uploading…")
+
+            async with UPLOAD_SEMAPHORE:
+                if result["type"] == "photos":
+                    cap = make_caption(emoji, result["title"], result.get("description", ""))
+                    await _send_photo_collection(chat, result, cap, mid)
+                    if result.get("audio_path"):
+                        await send_audio(chat, result["audio_path"], make_caption(emoji, result["title"], extra="Audio"), mid)
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
+
+                elif result["type"] == "media":
+                    cap = make_caption(emoji, result["title"], result.get("description", ""))
+                    await _send_mixed_media(chat, result, cap, mid)
+                    if result.get("audio_path"):
+                        await send_audio(chat, result["audio_path"], make_caption(emoji, result["title"], extra="Audio"), mid)
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
+
+                elif result["type"] == "audio":
+                    cap = make_caption(emoji, result["title"], result.get("description", ""), "audio only")
+                    await send_audio(chat, result["path"], cap, mid)
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
+
+                else:
+                    size_mb = result["size"] / 1048576
+                    clip_note = ""
+                    if clip_request:
+                        if "end" in clip_request:
+                            clip_note = f"\nClip: {clip_request['start']}s → {clip_request['end']}s"
+                        else:
+                            clip_note = f"\nClip: {clip_request['start']}s +{clip_request['duration']}s"
+                    cap = make_caption(emoji, result["title"], result.get("description", ""), f"{size_mb:.1f} MB{clip_note}")
+                    await send_video(chat, result["path"], cap, mid,
+                                     result["duration"], result["width"], result["height"])
+                    await send_description_if_needed(chat, emoji, result, cap, mid)
+
+            if sid:
+                await delete_msg(chat, sid)
+
+        except Exception as e:
+            log.error("Upload: %s", e)
+            if sid:
+                await edit_text(chat, sid, "❌ Upload failed")
+            asyncio.create_task(_del_later(chat, sid, 15))
+
+    finally:
+        shutil.rmtree(result.get("dir", "") if result else "", ignore_errors=True)
+        busy.discard(key)
+
+
 async def handle(update):
     if update.get("callback_query"):
         await handle_callback(update["callback_query"])
         return
 
-    msg  = update.get("message", {})
+    msg = update.get("message", {})
     text = msg.get("text", "")
     chat = msg.get("chat", {}).get("id")
-    mid  = msg.get("message_id")
+    mid = msg.get("message_id")
     if not chat or not text:
         return
 
@@ -1472,115 +1880,11 @@ async def handle(update):
         await send_text(chat, f"{bot_help_text()}\n\n{proxy_status_text()}", mid, proxy_keyboard())
         return
 
-    if text.startswith("/start"):
-        await send_text(chat, (
-            "🎬 Video Downloader\n\n"
-            "Send a link from:\n"
-            "• TikTok\n• Instagram\n• YouTube\n• X / Twitter\n\n"
-            "Works in groups — just drop a link."
-        ), mid, proxy_keyboard())
-        return
-
     urls = find_urls(text)
     if not urls:
         return
 
-    for platform, url in urls[:3]:
-        key = hash(url)
-        if key in busy:
-            continue
-        busy.add(key)
-        result = None
-        try:
-            emoji = EMOJI.get(platform, "🎬")
-            res   = await send_text(chat, f"{emoji} Downloading…", mid)
-            sid   = res.get("result", {}).get("message_id")
-
-            result, err = await download_media(url, platform)
-
-            clip_request = None
-            if platform == "youtube":
-                clip_request = extract_clip_request(text, url)
-                if clip_request and result and result.get("type") == "video":
-                    clip_path = str(Path(result["dir"]) / "clip.mp4")
-                    ok = await cut_video_clip(
-                        result["path"],
-                        clip_path,
-                        clip_request["start"],
-                        clip_request["duration"],
-                    )
-                    if ok:
-                        try:
-                            os.remove(result["path"])
-                        except Exception:
-                            pass
-                        dur, w, h = await _ffprobe(clip_path)
-                        result["path"] = clip_path
-                        result["size"] = Path(clip_path).stat().st_size
-                        result["duration"] = dur
-                        result["width"] = w or result.get("width", 0)
-                        result["height"] = h or result.get("height", 0)
-                    else:
-                        err = "Could not cut requested clip"
-
-            if err and platform == "youtube" and "sign in" in err.lower():
-                err = "YouTube blocked this server. Set YOUTUBE_COOKIES_BASE64 env var."
-
-            if err:
-                if sid:
-                    await edit_text(chat, sid, f"❌ {err[:300]}")
-                asyncio.create_task(_del_later(chat, sid, 15))
-                continue
-
-            try:
-                if sid:
-                    await edit_text(chat, sid, "⬆️ Uploading…")
-
-                if result["type"] == "photos":
-                    paths = result["photo_paths"]
-                    cap   = make_caption(emoji, result["title"], result.get("description", ""))
-                    for offset in range(0, len(paths), 10):
-                        chunk = paths[offset:offset + 10]
-                        chunk_caption = cap if offset == 0 else ""
-                        if len(chunk) == 1:
-                            await send_photo(chat, chunk[0], chunk_caption, mid)
-                        else:
-                            await send_media_group(chat, chunk, chunk_caption, mid)
-                    if result.get("audio_path"):
-                        await send_audio(chat, result["audio_path"], make_caption(emoji, result["title"], extra="Audio"), mid)
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
-
-                # FIX: route audio-only results to sendAudio instead of sendVideo
-                elif result["type"] == "audio":
-                    cap = make_caption(emoji, result["title"], result.get("description", ""), "audio only")
-                    await send_audio(chat, result["path"], cap, mid)
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
-
-                else:
-                    size_mb = result["size"] / 1048576
-                    clip_note = ""
-                    if clip_request:
-                        if "end" in clip_request:
-                            clip_note = f"\nClip: {clip_request['start']}s → {clip_request['end']}s"
-                        else:
-                            clip_note = f"\nClip: {clip_request['start']}s +{clip_request['duration']}s"
-                    cap     = make_caption(emoji, result["title"], result.get("description", ""), f"{size_mb:.1f} MB{clip_note}")
-                    await send_video(chat, result["path"], cap, mid,
-                                     result["duration"], result["width"], result["height"])
-                    await send_description_if_needed(chat, emoji, result, cap, mid)
-
-                if sid:
-                    await delete_msg(chat, sid)
-
-            except Exception as e:
-                log.error("Upload: %s", e)
-                if sid:
-                    await edit_text(chat, sid, "❌ Upload failed")
-                asyncio.create_task(_del_later(chat, sid, 15))
-
-        finally:
-            shutil.rmtree(result.get("dir", "") if result else "", ignore_errors=True)
-            busy.discard(key)
+    await asyncio.gather(*(process_url(chat, mid, text, platform, url) for platform, url in urls[:MAX_LINKS_PER_MESSAGE]))
 
 
 async def _del_later(chat, mid, delay):
