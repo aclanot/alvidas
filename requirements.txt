@@ -1,2 +1,2 @@
-aiohttp>=3.9
-yt-dlp
+aiohttp==3.13.5
+yt-dlp==2026.3.17
