@@ -1227,19 +1227,68 @@ async def _instagram_fast(url):
         return None, None
 
 
+MAX_TELEGRAM_CAPTION = 1024
+MAX_TELEGRAM_TEXT = 4096
+
+
 def make_caption(emoji, title, description="", extra=""):
     lines = [f"{emoji} {title}".strip()]
     if extra:
         lines.append(extra.strip())
-    if description and description.strip() and description.strip() not in lines[0]:
-        lines.append(description.strip())
-    return "\n\n".join([line for line in lines if line])[:1024]
+
+    description = (description or "").strip()
+    if description and description not in lines[0]:
+        candidate = "\n\n".join([*lines, description])
+        if len(candidate) <= MAX_TELEGRAM_CAPTION:
+            lines.append(description)
+
+    return "\n\n".join([line for line in lines if line])[:MAX_TELEGRAM_CAPTION]
 
 
 async def send_description_if_needed(chat, emoji, result, caption, reply):
     description = (result.get("description") or "").strip()
-    if description and description not in caption:
-        await send_text(chat, f"{emoji} Description:\n{description[:3900]}", reply)
+    if not description:
+        return
+
+    # If the full description fit into the media caption, do not send it again.
+    # Long descriptions are intentionally omitted from captions and sent once as text.
+    if description in caption:
+        return
+
+    await send_text(chat, f"{emoji} Description:\n{description[:MAX_TELEGRAM_TEXT - 32]}", reply)
+
+
+def _result_files(result):
+    if not result:
+        return []
+    files = []
+    if result.get("path"):
+        files.append(result["path"])
+    files.extend(result.get("photo_paths") or [])
+    files.extend(item.get("path") for item in result.get("media") or [] if item.get("path"))
+    if result.get("audio_path"):
+        files.append(result["audio_path"])
+    return files
+
+
+def validate_result_size(result):
+    for file_path in _result_files(result):
+        try:
+            size = Path(file_path).stat().st_size
+        except FileNotFoundError:
+            return f"Downloaded file missing: {Path(file_path).name}"
+        if size > MAX_TG:
+            return f"Too large for Telegram bot upload ({size // 1048576} MB, limit 50 MB)"
+    return None
+
+
+async def _validated(result, err):
+    if result:
+        size_err = validate_result_size(result)
+        if size_err:
+            shutil.rmtree(result.get("dir", ""), ignore_errors=True)
+            return None, size_err
+    return result, err
 
 
 def _result_files(result):
